@@ -69,7 +69,13 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/usb_descriptors.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/sys_stubs.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_cbor.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_util.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_alg.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_ecc.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_hdr.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_key.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_struct.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfcose/src/wolfcose_recipient.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/asn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wc_port.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wolfmath.c

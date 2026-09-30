@@ -20,7 +20,10 @@ CFLAGS  := -O1 -Wall -DWOLFSSL_USER_SETTINGS -DNO_PWDBASED -DNO_PKCS8 \
 WC_SRC  := ecc sp_c32 sp_int wolfmath memory misc random hash sha256 hmac \
            error logging wc_port asn coding kdf aes
 SRC     := cose_wire_test.c \
-           $(WOLFCOSE)/src/wolfcose.c $(WOLFCOSE)/src/wolfcose_cbor.c \
+           $(WOLFCOSE)/src/wolfcose_cbor.c $(WOLFCOSE)/src/wolfcose_util.c \
+           $(WOLFCOSE)/src/wolfcose_alg.c $(WOLFCOSE)/src/wolfcose_ecc.c \
+           $(WOLFCOSE)/src/wolfcose_hdr.c $(WOLFCOSE)/src/wolfcose_key.c \
+           $(WOLFCOSE)/src/wolfcose_struct.c $(WOLFCOSE)/src/wolfcose_recipient.c \
            $(patsubst %,$(WOLFSSL)/wolfcrypt/src/%.c,$(WC_SRC))
 
 all: cose_wire_test
