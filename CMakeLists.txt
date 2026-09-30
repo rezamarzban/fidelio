@@ -61,7 +61,7 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cred_alg.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cred_store.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/alg_probe.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/cert.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/att.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ctap2.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/fdo.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/u2f.c

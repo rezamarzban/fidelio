@@ -12,7 +12,7 @@
 #include "wolfssl/wolfcrypt/asn.h"
 #include "wolfssl/wolfcrypt/random.h"
 #include "wolfssl/wolfcrypt/kdf.h"
-#include "cert.h"
+#include "att.h"
 #include "pins.h"
 #include "flash_rt.h"
 #include "pico/stdlib.h"
@@ -227,6 +227,13 @@ static void pin_state_reset(void)
     pin_token_valid = false;
     pin_auth_fails = 0;
     ForceZero(pin_token, sizeof(pin_token));
+    /* pin_agree_key is a live wolfCrypt allocation: wc_ecc_free() it before
+     * dropping pin_agree_valid, which is what lets later paths free it
+     * exactly once. */
+    if (pin_agree_valid) {
+        wc_ecc_free(&pin_agree_key);
+        ForceZero(&pin_agree_key, sizeof(pin_agree_key));
+    }
     pin_agree_valid = false;
     pin_agree_consumed = true;
     fidelio_flash_erase(FLASH_PIN_A_OFF, FLASH_SECTOR_SIZE);
@@ -292,11 +299,16 @@ static void pin_state_save(void)
     pin_cur_off = target;
 }
 
-static void pin_reset_token(WC_RNG *rng)
+static int pin_reset_token(WC_RNG *rng)
 {
-    wc_RNG_GenerateBlock(rng, pin_token, sizeof(pin_token));
+    if (wc_RNG_GenerateBlock(rng, pin_token, sizeof(pin_token)) != 0) {
+        ForceZero(pin_token, sizeof(pin_token));
+        pin_token_valid = false;
+        return -1;
+    }
     pin_token_valid = true;
     pin_auth_fails = 0;
+    return 0;
 }
 
 static int pin_generate_agreement_key(WC_RNG *rng)
@@ -323,7 +335,8 @@ static int pin_shared_secret(const uint8_t *peer_x, const uint8_t *peer_y, uint8
     ecc_key peer;
     uint8_t ecdh[ECC_SZ * 2];
     word32 ecdh_len = sizeof(ecdh);
-    uint8_t z[32];
+    uint8_t ss[HASH_SZ];
+
     if (!pin_agree_valid)
         return -1;
     wc_ecc_init(&peer);
@@ -335,17 +348,18 @@ static int pin_shared_secret(const uint8_t *peer_x, const uint8_t *peer_y, uint8
     ret = wc_ecc_shared_secret(&pin_agree_key, &peer, ecdh, &ecdh_len);
     wc_ecc_free(&peer);
     if (ret != 0)
-        return -1;
+        goto out;
     /* Protocol 1: sharedSecret = SHA256(ECDH), used for both HMAC and AES keys */
-    uint8_t ss[HASH_SZ];
     if (wc_Sha256Hash(ecdh, ecdh_len, ss) != 0)
-        return -1;
+        goto out;
     memcpy(secret_out, ss, HASH_SZ);
     memcpy(secret_out + HASH_SZ, ss, HASH_SZ);
+    ret = 0;
+
+out:
     ForceZero(ecdh, sizeof(ecdh));
-    ForceZero(z, sizeof(z));
     ForceZero(ss, sizeof(ss));
-    return 0;
+    return ret;
 }
 
 static int pin_encrypt(const uint8_t *key, const uint8_t *in, uint16_t in_len, uint8_t *out, uint16_t *out_len, WC_RNG *rng)
@@ -1264,6 +1278,8 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     wc_Sha256 sha;
     WC_RNG rng;
     ecc_key cert_ecc;
+    const uint8_t *att_der;
+    uint32_t att_der_len = 0;
     int ret;
 
     memset(&user_key, 0, sizeof(user_key));
@@ -1337,9 +1353,12 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
         return 0;
     }
 
-    wc_ecc_init(&cert_ecc);
-
-    word32 inOutIdx = 0;
+    /* Per-device attestation key and certificate, both derived from the PUF
+     * secret (src/att.c). att_key_init() initialises cert_ecc itself and
+     * leaves it zeroed on failure, which is safe to free in cleanup. */
+    if (att_key_init(&cert_ecc) != 0) {
+        ret = -1; goto cleanup;
+    }
     if (cred_alg_derive(alg, device_get_secret(), rpIdHash, credId + 1,
                         &user_key) != 0) {
         ret = -1; goto cleanup;
@@ -1373,15 +1392,15 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
         ForceZero(&rec, sizeof(rec));
     }
 
-    if (wc_EccPrivateKeyDecode(cert_master_key_der, &inOutIdx, &cert_ecc, cert_master_key_der_len) != 0) {
-        ret = -1; goto cleanup;
-    }
-    if (wc_ecc_check_key(&cert_ecc) != 0) {
+    if (att_cert_get(&rng, &att_der, &att_der_len) != 0) {
         ret = -1; goto cleanup;
     }
 
     uint8_t flags = 0x41;
-    if (pin_store.magic == FLASH_PIN_MAGIC && params.pin_auth && params.pin_auth_len == 16)
+    /* From the verified state, as getAssertion does. The old pin_auth_len == 16
+     * test dropped the UV bit for a pinAuth that pin_require_for_op() had
+     * verified at 32 bytes. */
+    if (pin_verified)
         flags |= 0x04;
 
     if (build_authdata_attested(rpIdHash, flags, CTAP2_SIGN_COUNT, credId, credIdLen, &user_key,
@@ -1420,7 +1439,7 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     if (wc_CBOR_EncodeBstr(&c, signature, (size_t)siglen) != 0) { ret = -1; goto cleanup; }
     if (cbor_put_text(&c, "x5c") != 0) { ret = -1; goto cleanup; }
     if (wc_CBOR_EncodeArrayStart(&c, 1) != 0) { ret = -1; goto cleanup; }
-    if (wc_CBOR_EncodeBstr(&c, cert_att_der, cert_att_der_len) != 0) { ret = -1; goto cleanup; }
+    if (wc_CBOR_EncodeBstr(&c, att_der, att_der_len) != 0) { ret = -1; goto cleanup; }
 
     *reply_len = (uint16_t)(c.idx + 1);
     ret = 0;
@@ -1840,7 +1859,9 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
         }
         case 2: { /* getKeyAgreement */
             WOLFCOSE_CBOR_CTX rc;
-            wc_InitRng(&rng);
+            if (wc_InitRng(&rng) != 0) {
+                reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
+            }
             if (pin_generate_agreement_key(&rng) != 0) {
                 wc_FreeRng(&rng);
                 reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
@@ -1902,8 +1923,13 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
              */
             pin_store.retries = PIN_MAX_RETRIES;
             pin_state_save();
-            wc_InitRng(&rng);
-            pin_reset_token(&rng);
+            if (wc_InitRng(&rng) != 0) {
+                reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
+            }
+            if (pin_reset_token(&rng) != 0) {
+                wc_FreeRng(&rng);
+                reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
+            }
             wc_FreeRng(&rng);
             WOLFCOSE_CBOR_CTX rc;
             wc_CBOR_EncoderInit(&rc, reply + 1, (size_t)(reply_max - 1));
@@ -1981,8 +2007,13 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
              */
             pin_store.retries = PIN_MAX_RETRIES;
             pin_state_save();
-            wc_InitRng(&rng);
-            pin_reset_token(&rng);
+            if (wc_InitRng(&rng) != 0) {
+                reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
+            }
+            if (pin_reset_token(&rng) != 0) {
+                wc_FreeRng(&rng);
+                reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
+            }
             wc_FreeRng(&rng);
             WOLFCOSE_CBOR_CTX rc;
             wc_CBOR_EncoderInit(&rc, reply + 1, (size_t)(reply_max - 1));
@@ -2024,8 +2055,13 @@ static int ctap2_client_pin_inner(const uint8_t *payload, uint16_t payload_len,
                 ForceZero(pin_shared, sizeof(pin_shared));
                 reply[0] = CTAP2_ERR_PIN_INVALID; *reply_len = 1; return 0;
             }
-            wc_InitRng(&rng);
-            pin_reset_token(&rng);
+            if (wc_InitRng(&rng) != 0) {
+                reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
+            }
+            if (pin_reset_token(&rng) != 0) {
+                wc_FreeRng(&rng);
+                reply[0] = CTAP2_ERR_INVALID_COMMAND; *reply_len = 1; return 0;
+            }
             pin_restore_retries();
             /* Encrypt pinToken with AES-256-CBC, IV=0, no IV prefix (protocol 1). */
             {

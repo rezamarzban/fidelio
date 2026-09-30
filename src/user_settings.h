@@ -148,6 +148,22 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 
 #define NO_INLINE
 
+/* On-device attestation certificate generation (src/att.c). The attestation
+ * key is derived per device from the PUF secret, so its self-signed
+ * certificate has to be built on the device too - there is no build-time
+ * public key to bake one around any more.
+ *
+ * WOLFSSL_CERT_EXT covers the subjectKeyIdentifier and extendedKeyUsage the
+ * development certificate carried; WOLFSSL_EKU_OID plus HAVE_OID_ENCODING
+ * are what let extendedKeyUsage name the FIDO transports OID, which is not
+ * one of wolfSSL's built-in tokens. Certificate parsing is not enabled: the
+ * device only ever emits.
+ */
+#define WOLFSSL_CERT_GEN
+#define WOLFSSL_CERT_EXT
+#define WOLFSSL_EKU_OID
+#define HAVE_OID_ENCODING
+
 
 /* SP math: WOLFSSL_SP_MATH selects the reduced implementation that only
  * covers the SP-accelerated curves (P-256 here). It is mutually exclusive

@@ -32,7 +32,7 @@
 #include "wolfssl/wolfcrypt/ecc.h"
 #include "wolfssl/wolfcrypt/asn.h"
 #include "wolfssl/wolfcrypt/hmac.h"
-#include "cert.h"
+#include "att.h"
 #include "ctap2.h"
 #include "device_state.h"
 #include "pins.h"
@@ -275,6 +275,42 @@ static void ctaphid_send_error(uint32_t cid, uint8_t err)
     tud_hid_report(0, frame, sizeof(frame));
 }
 
+/* P-256 group order. A 256-bit HMAC output is a valid private scalar only
+ * below this, which fails with probability ~2^-32. The output is always
+ * less than 2n, so the reduction is one conditional subtraction; it is the
+ * identity for every scalar that was already valid, so existing credentials
+ * are untouched.
+ */
+static const uint8_t P256_ORDER[32] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
+    0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51
+};
+
+static void p256_reduce_scalar(uint8_t *s)
+{
+    uint32_t i;
+    uint32_t a, sub, borrow;
+    int ge = 0;
+
+    for (i = 0; i < 32; i++) {
+        if (s[i] != P256_ORDER[i]) {
+            ge = (s[i] > P256_ORDER[i]) ? 1 : 0;
+            break;
+        }
+    }
+    if (!ge)
+        return;
+    borrow = 0;
+    for (i = 32; i > 0; i--) {
+        a = s[i - 1];
+        sub = P256_ORDER[i - 1] + borrow;
+        borrow = (a < sub) ? 1 : 0;
+        s[i - 1] = (uint8_t)(a - sub);
+    }
+}
+
 static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
 {
     uint8_t sig_hash[HASH_SZ];
@@ -291,9 +327,11 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     uint8_t rfu_res = 0;
     uint8_t pubkey[PUBKEY_SZ];
     uint8_t user_private[ECC_SZ];
-    word32 inOutIdx = 0;
     uint32_t idx = 0;
     uint8_t *challenge, *application;
+    const uint8_t *att_der;
+    uint32_t att_der_len = 0;
+    uint16_t sw = 0x6111;
     ecc_key user_ecc;
     ecc_key cert_ecc;
     WC_RNG rng;
@@ -309,63 +347,79 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     if (wc_InitRng(&rng) != 0)
         return 0x6110;
     if (wc_ecc_init(&user_ecc) != 0)
-        return 0x6111;
-    if (wc_ecc_init(&cert_ecc) != 0)
-        return 0x6111;
+        goto cleanup;
 
-    /* Import certificate private key */
-    if (wc_EccPrivateKeyDecode(cert_master_key_der, &inOutIdx, &cert_ecc, cert_master_key_der_len) != 0) {
-        return 0x6113;
+    /* Per-device attestation key and certificate, both derived from the PUF
+     * secret (src/att.c). att_key_init() initialises cert_ecc itself and
+     * leaves it zeroed on failure, which is safe to free below.
+     */
+    if (att_key_init(&cert_ecc) != 0) {
+        sw = 0x6113;
+        goto cleanup;
     }
-    
-    /* Check imported key */
-    if (wc_ecc_check_key(&cert_ecc) != 0) {
-        return 0x6118;
+    if (att_cert_get(&rng, &att_der, &att_der_len) != 0) {
+        sw = 0x6113;
+        goto cleanup;
     }
-    
 
-    /* Calculate private key (nonce + application) */ 
+    /* Calculate private key (nonce + application) */
     ret = wc_HmacInit(&hmac, NULL, 0);
-    if (ret != 0)
-        return 0x6114;
+    if (ret != 0) {
+        sw = 0x6114;
+        goto cleanup;
+    }
     ret = wc_RNG_GenerateBlock(&rng, handle_nonce, NONCE_SZ);
-    if (ret != 0)
-        return 0x6114;
-    ret = wc_HmacSetKey(&hmac, SHA256, device_secret, ECC_SZ); 
-    if (ret != 0)
-        return 0x6116;
+    if (ret != 0) {
+        sw = 0x6114;
+        goto cleanup;
+    }
+    ret = wc_HmacSetKey(&hmac, SHA256, device_secret, ECC_SZ);
+    if (ret != 0) {
+        sw = 0x6116;
+        goto cleanup;
+    }
     wc_HmacUpdate(&hmac, application, PARAM_SZ);
     wc_HmacUpdate(&hmac, handle_nonce, NONCE_SZ);
     wc_HmacFinal(&hmac, user_private);
     wc_HmacFree(&hmac);
+    /* The raw HMAC output reaches the curve order with probability ~2^-32;
+     * reduce it so registration cannot fail on scalar range. */
+    p256_reduce_scalar(user_private);
 
     /* Calculate user handle (private + application) */
     ret = wc_HmacInit(&hmac, NULL, 0);
-    if (ret != 0)
-        return 0x6114;
-    ret = wc_HmacSetKey(&hmac, SHA256, device_secret, ecc_key_size); 
-    if (ret != 0)
-        return 0x6116;
+    if (ret != 0) {
+        sw = 0x6114;
+        goto cleanup;
+    }
+    ret = wc_HmacSetKey(&hmac, SHA256, device_secret, ecc_key_size);
+    if (ret != 0) {
+        sw = 0x6116;
+        goto cleanup;
+    }
     wc_HmacUpdate(&hmac, application, PARAM_SZ);
     wc_HmacUpdate(&hmac, user_private, ECC_SZ);
     wc_HmacFinal(&hmac, handle_hash);
     wc_HmacFree(&hmac);
     if (wc_ecc_import_private_key_ex(user_private, ecc_key_size, NULL, 0,
                 &user_ecc, ECC_SECP256R1) != 0)
-        return 0x6111;
-    ret = wc_ecc_make_pub_ex(&user_ecc, NULL, NULL); 
+        goto cleanup;
+    ret = wc_ecc_make_pub_ex(&user_ecc, NULL, NULL);
     /* At this point the user key should be complete. */
     if (wc_ecc_check_key(&user_ecc) != 0) {
-        return 0x6118;
+        sw = 0x6118;
+        goto cleanup;
     }
     /* Export public key */
-    pubkey[0] = 0x04; /* First byte 0x04 indicating uncompressed 
-                       *  public key (qx, qy) 
+    pubkey[0] = 0x04; /* First byte 0x04 indicating uncompressed
+                       *  public key (qx, qy)
                        */
     ret = wc_ecc_export_public_raw(&user_ecc, &pubkey[1], &qxlen,
-            &pubkey[1 + ecc_key_size], &qylen); 
-    if (ret != 0)
-        return 0x6113;
+            &pubkey[1 + ecc_key_size], &qylen);
+    if (ret != 0) {
+        sw = 0x6113;
+        goto cleanup;
+    }
 
     /* Prepare the digest to sign */
     wc_InitSha256(&sha);
@@ -378,16 +432,16 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     wc_Sha256Final(&sha, sig_hash);
     wc_Sha256Free(&sha);
 
-    /* Sign the digest */
+    /* Sign the digest; a failure must not burn the usage counter. */
     memset(signature, 0, sizeof(signature));
     siglen = (word32)wc_ecc_sig_size(&cert_ecc);
-    ret = wc_ecc_sign_hash(sig_hash, HASH_SZ, signature, &siglen, &rng,
-            &cert_ecc);
-    
-    U2F_Counter_up();
+    if (wc_ecc_sign_hash(sig_hash, HASH_SZ, signature, &siglen, &rng,
+            &cert_ecc) != 0) {
+        sw = 0x6113;
+        goto cleanup;
+    }
 
-    /* Populate reply message
-     */
+    /* Populate reply message */
     U2F_cmd_reply[idx++] = 0x05; /* Legacy fixed first byte for the response */
     memcpy(&U2F_cmd_reply[idx], pubkey, PUBKEY_SZ);
     idx += PUBKEY_SZ;
@@ -397,21 +451,32 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     idx += NONCE_SZ;
     memcpy(&U2F_cmd_reply[idx], handle_hash, HASH_SZ);
     idx += HASH_SZ;
-    /* Copy attestation certificate into reply */
-    memcpy(&U2F_cmd_reply[idx], cert_att_der, cert_att_der_len);
-    idx += cert_att_der_len;
+    /* Copy attestation certificate into reply. Its length is decided at
+     * runtime now, so check it against the buffer rather than trusting a
+     * compile-time constant.
+     */
+    if (idx + att_der_len + siglen > sizeof(U2F_cmd_reply)) {
+        sw = 0x6113;
+        goto cleanup;
+    }
+    memcpy(&U2F_cmd_reply[idx], att_der, att_der_len);
+    idx += att_der_len;
     /* Copy signature */
     memcpy(&U2F_cmd_reply[idx], signature, siglen);
     idx += siglen;
+    U2F_Counter_up();
     /* Send the reply */
     ctaphid_send(CTAP_CMD_MSG, (uint16_t)idx, true);
+    sw = ENOERR;
+
+cleanup:
     wc_FreeRng(&rng);
     wc_ecc_free(&user_ecc);
     wc_ecc_free(&cert_ecc);
     ForceZero(&user_ecc, sizeof(ecc_key));
     ForceZero(&cert_ecc, sizeof(ecc_key));
     ForceZero(user_private, ECC_SZ);
-    return ENOERR;
+    return sw;
 }
 
 
@@ -425,6 +490,7 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
     uint32_t be_u2f_counter;
     word32 siglen = SIGMAX_SZ;
     uint8_t *msg_data;
+    uint16_t sw = EWRONGDATA;
     ecc_key user_ecc;
     WC_RNG rng;
     Hmac hmac;
@@ -462,48 +528,67 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
     if (wc_InitRng(&rng) != 0)
         return 0x6110;
 
-    if (wc_ecc_init(&user_ecc) < 0)
-        return 0x6122;
+    if (wc_ecc_init(&user_ecc) != 0) {
+        sw = 0x6122;
+        goto cleanup;
+    }
 
-    if (handle_sz != (NONCE_SZ + HASH_SZ))
-        return 0x6120;
+    if (handle_sz != (NONCE_SZ + HASH_SZ)) {
+        sw = 0x6120;
+        goto cleanup;
+    }
 
     ret = wc_HmacInit(&hmac, NULL, 0);
-    if (ret != 0)
-        return 0x6124;
-    ret = wc_HmacSetKey(&hmac, SHA256, device_secret, ECC_SZ); 
-    if (ret != 0)
-        return 0x6126;
+    if (ret != 0) {
+        sw = 0x6124;
+        goto cleanup;
+    }
+    ret = wc_HmacSetKey(&hmac, SHA256, device_secret, ECC_SZ);
+    if (ret != 0) {
+        sw = 0x6126;
+        goto cleanup;
+    }
     wc_HmacUpdate(&hmac, application, PARAM_SZ);
     wc_HmacUpdate(&hmac, handle_nonce, NONCE_SZ);
     wc_HmacFinal(&hmac, private);
     wc_HmacFree(&hmac);
+    /* Same reduction as fido_register(): the stored handle was computed
+     * from the reduced scalar. */
+    p256_reduce_scalar(private);
 
     /* Verify obtained hash */
     ret = wc_HmacInit(&hmac, NULL, 0);
-    if (ret != 0)
-        return 0x6124;
-    ret = wc_HmacSetKey(&hmac, SHA256, device_secret, ECC_SZ); 
-    if (ret != 0)
-        return 0x6126;
+    if (ret != 0) {
+        sw = 0x6124;
+        goto cleanup;
+    }
+    ret = wc_HmacSetKey(&hmac, SHA256, device_secret, ECC_SZ);
+    if (ret != 0) {
+        sw = 0x6126;
+        goto cleanup;
+    }
     wc_HmacUpdate(&hmac, application, PARAM_SZ);
     wc_HmacUpdate(&hmac, private, ECC_SZ);
     wc_HmacFinal(&hmac, handle_calculated_hash);
     wc_HmacFree(&hmac);
     if (memcmp(handle_calculated_hash, handle_hash, HASH_SZ) != 0)
-        return EWRONGDATA;
+        goto cleanup;
 
     if (wc_ecc_import_private_key_ex(private, ECC_SZ, NULL, 0,
-                &user_ecc, ECC_SECP256R1) != 0)
-        return 0x6121;
-    ret = wc_ecc_make_pub_ex(&user_ecc, NULL, NULL); 
+                &user_ecc, ECC_SECP256R1) != 0) {
+        sw = 0x6121;
+        goto cleanup;
+    }
+    ret = wc_ecc_make_pub_ex(&user_ecc, NULL, NULL);
     /* At this point the user key should be complete. */
     if (wc_ecc_check_key(&user_ecc) != 0) {
-        return 0x6128;
+        sw = 0x6128;
+        goto cleanup;
     }
 
     if (control == 0x07) {
-        return ECOND;
+        sw = ECOND;
+        goto cleanup;
     }
 
     be_u2f_counter = __builtin_bswap32(U2F_Counter);
@@ -514,12 +599,15 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
     wc_Sha256Update(&sha, challenge, PARAM_SZ);         /* Challenge parameter */
     wc_Sha256Final(&sha, sig_hash);
     wc_Sha256Free(&sha);
-    
-    /* Sign the digest */
+
+    /* Sign the digest; a failure must not burn the usage counter. */
     memset(signature, 0, sizeof(signature));
     siglen = (uint16_t)wc_ecc_sig_size(&user_ecc);
-    ret = wc_ecc_sign_hash(sig_hash, HASH_SZ, signature, &siglen, &rng,
-            &user_ecc);
+    if (wc_ecc_sign_hash(sig_hash, HASH_SZ, signature, &siglen, &rng,
+            &user_ecc) != 0) {
+        sw = 0x6121;
+        goto cleanup;
+    }
 
     memset(U2F_cmd_reply, 0, sizeof(U2F_cmd_reply));
     U2F_cmd_reply[0] = user_presence;
@@ -530,11 +618,14 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
 
     /* Send the reply */
     ctaphid_send(CTAP_CMD_MSG, (uint16_t)(siglen + 5), true);
+    sw = ENOERR;
+
+cleanup:
     wc_FreeRng(&rng);
     wc_ecc_free(&user_ecc);
     ForceZero(&user_ecc, sizeof(ecc_key));
     ForceZero(private, ECC_SZ);
-    return ENOERR;
+    return sw;
 }
 
 static uint16_t fido_getversion(struct u2f_raw_hdr *hdr, uint16_t len)
@@ -687,6 +778,8 @@ int parse_u2fhid_packet(const uint8_t *data)
             return 0;
         }
         U2F_Message.exp_seq++;
+        if (U2F_Message.exp_seq >= 128)
+            U2F_Message.exp_seq = 0;
 
         sz_rx = U2FHID_PACKET_SIZE - 5;
         if (sz_rx > (U2F_Message.len - U2F_Message.rx_len))
@@ -753,7 +846,8 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const* report, uint8_t
         uint16_t remain_size;
         uint8_t u2h_msg[U2FHID_PACKET_SIZE];
         memset(u2h_msg, 0, U2FHID_PACKET_SIZE);
-        u2h_msg[4] = (uint8_t)(U2F_cmd_reply_seq & 0xFFU);
+        /* 7-bit sequence, wraps at 128 per CTAPHID. */
+        u2h_msg[4] = (uint8_t)(U2F_cmd_reply_seq & 0x7FU);
         U2F_cmd_reply_seq++;
         remain_size = U2FHID_PACKET_SIZE - 5;
         if (remain_size > U2F_cmd_reply_size - U2F_cmd_reply_sent)

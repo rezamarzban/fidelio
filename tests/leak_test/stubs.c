@@ -15,7 +15,7 @@
 #include "flash_rt.h"
 #include "ctap2.h"
 #include "fdo.h"
-#include "cert.h"
+#include "att.h"
 
 #define MAX_FRAMES 16
 
@@ -151,8 +151,11 @@ void ForceZero(void *mem, word32 len)
         memset(mem, 0, len);
 }
 
-/* Attestation material: dummies, never used on the paths under test. */
-const unsigned char cert_att_der[] = { 0xDE, 0xAD };
-const unsigned int cert_att_der_len = 2;
-const unsigned char cert_master_key_der[] = { 0xBE, 0xEF };
-const unsigned int cert_master_key_der_len = 2;
+/* Attestation: fails, matching the wolfCrypt stubs; the leak paths under
+ * test never reach it. */
+int att_key_init(ecc_key *key) { (void)key; return -1; }
+int att_cert_get(WC_RNG *rng, const uint8_t **der, uint32_t *der_len)
+{
+    (void)rng; (void)der; (void)der_len;
+    return -1;
+}

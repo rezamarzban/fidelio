@@ -27,6 +27,9 @@
 #include "wolfssl/wolfcrypt/puf.h"
 #include "wolfssl/wolfcrypt/random.h"
 #include "wolfssl/wolfcrypt/error-crypt.h"
+#include "wolfssl/wolfcrypt/hmac.h"
+#include "wolfssl/wolfcrypt/kdf.h"
+#include "wolfssl/wolfcrypt/sha256.h"
 #include "puf_sram.h"
 #include "indicator.h"
 #include "flash_rt.h"
@@ -53,6 +56,7 @@ extern void ForceZero(void* mem, word32 len);
 #define PUF_CODE_ENROLLED     1 /* enrolled, power-cycle to verify */
 #define PUF_CODE_RECONSTRUCT  2 /* reconstruction failed, power-cycle to retry */
 #define PUF_CODE_CONFIG       3 /* build or memory-map fault, not retryable */
+#define PUF_CODE_MAC          4 /* checkpoint MAC mismatch, not retryable */
 
 /* HKDF info: a fixed label binding the key to this use, followed by a salt
  * drawn once per enrollment.
@@ -66,6 +70,15 @@ extern void ForceZero(void* mem, word32 len);
  */
 #define PUF_SALT_SZ 32
 static const char puf_key_label[] = "fidelio-master-secret";
+
+/* Integrity marker over the whole checkpoint, keyed by a domain-separated
+ * child of the master secret. It stops a swapped or torn checkpoint from
+ * being trusted: after a firmware update the only checkpoint the device
+ * will accept is one it signed itself (or the all-0xFF legacy format,
+ * accepted once and re-signed, see puf_cp_mac_check()).
+ */
+#define PUF_MAC_SZ 16
+static const char puf_mac_label[] = "fidelio-puf-checkpoint-v1";
 
 /* The reserved SRAM response. Placed by src/memmap_fidelio.ld at the base of
  * SCRATCH_X in a NOLOAD section: never initialised, never written.
@@ -100,6 +113,7 @@ struct puf_checkpoint {
     uint32_t profileId;
     uint8_t salt[PUF_SALT_SZ];
     uint8_t helper[WC_PUF_HELPER_BYTES];
+    uint8_t mac[PUF_MAC_SZ];
 };
 
 /* fidelio_flash_program() writes whole pages. */
@@ -144,9 +158,13 @@ static void puf_halt(int code, uint16_t r, uint16_t g, uint16_t b)
     }
 }
 
+static int puf_cp_mac(const struct puf_checkpoint *cp, const uint8_t *secret,
+                      uint8_t *mac);
+
 static void __not_in_flash_func(puf_write_checkpoint)(uint32_t magic,
                                                       const uint8_t *salt,
-                                                      const uint8_t *helper)
+                                                      const uint8_t *helper,
+                                                      const uint8_t *secret)
 {
     /* Static: 512 bytes is a quarter of the 2 KB core-0 stack. */
     static uint8_t page[PUF_PAGE_SPAN];
@@ -157,6 +175,12 @@ static void __not_in_flash_func(puf_write_checkpoint)(uint32_t magic,
     cp->profileId = (uint32_t)WC_PUF_PROFILE_ID;
     memcpy(cp->salt, salt, PUF_SALT_SZ);
     memcpy(cp->helper, helper, WC_PUF_HELPER_BYTES);
+    /* HKDF and HMAC cannot realistically fail here; a failure writes an
+     * all-zero MAC so the next boot halts on mismatch instead of silently
+     * downgrading to the legacy all-0xFF acceptance.
+     */
+    if (puf_cp_mac(cp, secret, cp->mac) != 0)
+        memset(cp->mac, 0, PUF_MAC_SZ);
     fidelio_flash_erase(FLASH_PUF_OFF, FLASH_SECTOR_SIZE);
     fidelio_flash_program(FLASH_PUF_OFF, page, sizeof(page));
     ForceZero(page, sizeof(page));
@@ -182,6 +206,66 @@ static int puf_derive(wc_PufCtx *ctx, const uint8_t *salt)
     if (ret != 0)
         return -1;
     secret_valid = true;
+    return 0;
+}
+
+/* The MAC key is a domain-separated child of the master secret, so a
+ * checkpoint signature can neither be confused with any other derivation
+ * from the secret nor reused as one.
+ */
+static int puf_cp_mac_key(const uint8_t *secret, uint8_t *key)
+{
+    return wc_HKDF_Expand(WC_SHA256, secret, WC_PUF_KEY_SZ,
+                          (const byte *)puf_mac_label,
+                          (word32)(sizeof(puf_mac_label) - 1), key, 32);
+}
+
+/* HMAC-SHA256 over everything in the checkpoint that precedes the MAC
+ * field, truncated to PUF_MAC_SZ bytes.
+ */
+static int puf_cp_mac(const struct puf_checkpoint *cp, const uint8_t *secret,
+                      uint8_t *mac)
+{
+    uint8_t key[32];
+    Hmac hmac;
+    int ret;
+
+    if (puf_cp_mac_key(secret, key) != 0)
+        return -1;
+    ret = wc_HmacInit(&hmac, NULL, 0);
+    if (ret == 0)
+        ret = wc_HmacSetKey(&hmac, SHA256, key, sizeof(key));
+    if (ret == 0)
+        ret = wc_HmacUpdate(&hmac, (const byte *)cp,
+                            offsetof(struct puf_checkpoint, mac));
+    if (ret == 0)
+        ret = wc_HmacFinal(&hmac, mac);
+    wc_HmacFree(&hmac);
+    ForceZero(key, sizeof(key));
+    return ret;
+}
+
+/* 0: the MAC verifies; 1: legacy all-0xFF field (written before this
+ * firmware); -1: mismatch, the checkpoint was not signed by a device that
+ * knew this secret.
+ */
+static int puf_cp_mac_check(const struct puf_checkpoint *cp,
+                            const uint8_t *secret)
+{
+    uint8_t mac[PUF_MAC_SZ];
+    uint32_t i;
+    int legacy = 1;
+
+    for (i = 0; i < PUF_MAC_SZ; i++)
+        if (cp->mac[i] != 0xFF)
+            legacy = 0;
+    if (legacy)
+        return 1;
+    if (puf_cp_mac(cp, secret, mac) != 0)
+        return -1;
+    for (i = 0; i < PUF_MAC_SZ; i++)
+        if (cp->mac[i] != mac[i])
+            return -1;
     return 0;
 }
 
@@ -214,13 +298,18 @@ int puf_rotate_salt(void)
         return -1;
 
     /* Re-derive in place from the snapshot taken at boot, so the device stays
-     * usable across the reset rather than demanding a power cycle. */
+     * usable across the reset rather than demanding a power cycle. Derive
+     * before writing, so the checkpoint is signed by the secret the new
+     * salt produces.
+     */
     if (wc_PufInit(&ctx) == 0 &&
         wc_PufReadSram(&ctx, puf_raw, sizeof(puf_raw)) == 0 &&
         wc_PufReconstructEx(&ctx, helper, sizeof(helper),
                             (word32)WC_PUF_PROFILE_ID) == 0) {
-        puf_write_checkpoint(PUF_MAGIC_COMMITTED, salt, helper);
         ret = puf_derive(&ctx, salt);
+        if (ret == 0)
+            puf_write_checkpoint(PUF_MAGIC_COMMITTED, salt, helper,
+                                 master_secret);
     }
     wc_PufZeroize(&ctx);
     ForceZero(salt, sizeof(salt));
@@ -534,6 +623,19 @@ int puf_provision(void)
         wc_PufZeroize(&ctx);
         if (ret != 0)
             puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
+        {
+            int m = puf_cp_mac_check(cp, master_secret);
+            if (m == 1) {
+                /* Legacy checkpoint from a pre-MAC firmware: accept once and
+                 * re-sign it, closing the window. A flash writer could have
+                 * planted a legacy-format checkpoint anyway, so the
+                 * migration grants no new capability.
+                 */
+                puf_write_checkpoint(PUF_MAGIC_COMMITTED, cp->salt,
+                                     cp->helper, master_secret);
+            } else if (m != 0)
+                puf_halt(PUF_CODE_MAC, 0x20, 0, 0x20);
+        }
         return 0;
     }
 
@@ -547,14 +649,19 @@ int puf_provision(void)
                                 cp->profileId) == 0) {
             uint8_t salt[PUF_SALT_SZ];
             uint8_t helper[WC_PUF_HELPER_BYTES];
+            int m;
             memcpy(salt, cp->salt, sizeof(salt));
             memcpy(helper, cp->helper, sizeof(helper));
-            puf_write_checkpoint(PUF_MAGIC_COMMITTED, salt, helper);
-            ForceZero(helper, sizeof(helper));
             ret = puf_derive(&ctx, salt);
             wc_PufZeroize(&ctx);
             if (ret != 0)
                 puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
+            m = puf_cp_mac_check(cp, master_secret);
+            if (m != 0 && m != 1)
+                puf_halt(PUF_CODE_MAC, 0x20, 0, 0x20);
+            puf_write_checkpoint(PUF_MAGIC_COMMITTED, salt, helper,
+                                 master_secret);
+            ForceZero(helper, sizeof(helper));
             return 0;
         }
         /* Verification failed. Nothing has been registered against this
@@ -582,7 +689,16 @@ int puf_provision(void)
             wc_PufZeroize(&ctx);
             puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
         }
-        puf_write_checkpoint(PUF_MAGIC_PROVISIONAL, salt, helper);
+        /* Derive now, from this boot's own response, so the provisional
+         * checkpoint can be signed like the committed one. The verification
+         * boot re-derives the same secret from the same SRAM contents.
+         */
+        if (puf_derive(&ctx, salt) != 0) {
+            wc_PufZeroize(&ctx);
+            puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
+        }
+        puf_write_checkpoint(PUF_MAGIC_PROVISIONAL, salt, helper,
+                             master_secret);
         ForceZero(helper, sizeof(helper));
         wc_PufZeroize(&ctx);
     }
