@@ -247,6 +247,34 @@ static int ctaphid_send(uint8_t cmd, uint16_t sz, bool append_status_word)
     return 0;
 }
 
+/* CTAPHID error codes (CTAP 2.x, section 11.2.9.1.6). */
+#define CTAPHID_ERROR           0x3F
+#define CTAPHID_ERR_INVALID_CMD 0x01
+#define CTAPHID_ERR_INVALID_LEN 0x03
+#define CTAPHID_ERR_OTHER       0x7F
+
+/* Send a well-formed CTAPHID ERROR frame. The whole 64-byte report is zeroed
+ * first: the previous error path sent an uninitialised stack buffer, which
+ * disclosed 62 bytes of stack to any process with access to the HID node.
+ * The global continuation state is dropped too: without it, a reply that was
+ * mid-flight would keep streaming its stale frames after this error.
+ */
+static void ctaphid_send_error(uint32_t cid, uint8_t err)
+{
+    uint8_t frame[U2FHID_PACKET_SIZE];
+
+    U2F_cmd_reply_sent = 0;
+    U2F_cmd_reply_size = 0;
+    U2F_cmd_reply_seq = 0;
+    memset(frame, 0, sizeof(frame));
+    memcpy(frame, &cid, sizeof(cid));
+    frame[4] = 0x80 | CTAPHID_ERROR;
+    frame[5] = 0x00;                 /* payload length, MSB */
+    frame[6] = 0x01;                 /* payload length, LSB */
+    frame[7] = err;
+    tud_hid_report(0, frame, sizeof(frame));
+}
+
 static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
 {
     uint8_t sig_hash[HASH_SZ];
@@ -511,20 +539,14 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
 
 static uint16_t fido_getversion(struct u2f_raw_hdr *hdr, uint16_t len)
 {
-    const char proto_name[] = "U2F_V2";
-    uint8_t reply[U2FHID_PACKET_SIZE];
-    struct u2fhid_init_packet *ip = (struct u2fhid_init_packet *)reply;
+    static const char proto_name[] = "U2F_V2";
     (void)hdr;
     (void)len;
-    ip->cid = 0;
-    ip->hid_cmd = CTAP_CMD_MSG;
-    ip->payload_len[0] = 0;
-    ip->payload_len[1] = 8;
-    memcpy(reply + 7, proto_name, 6);
-    reply[14] = 0x90;
-    reply[15] = 0x00;
-    tud_hid_report(0, reply, U2FHID_PACKET_SIZE);
-    return 0x9000;
+    /* Reply through the common path so the frame is fully zero-padded and
+     * carries the caller's CID, then append SW 0x9000. */
+    memcpy(U2F_cmd_reply, proto_name, sizeof(proto_name) - 1);
+    ctaphid_send(CTAP_CMD_MSG, (uint16_t)(sizeof(proto_name) - 1), true);
+    return ENOERR;
 }
 
 static uint16_t parse_u2f_raw_msg(void)
@@ -614,12 +636,14 @@ static uint16_t parse_u2f_raw(void)
                 ctaphid_send(CTAP_CMD_CBOR, reply_len, false);
                 ret = ENOERR;
             } else {
-                ret = EWRONGDATA;
+                ctaphid_send_error(U2F_Message.cid, CTAPHID_ERR_OTHER);
+                ret = ENOERR;
             }
             break;
         }
         default:
-            return EWRONGDATA;
+            ctaphid_send_error(U2F_Message.cid, CTAPHID_ERR_INVALID_CMD);
+            return ENOERR;
     }
     return ret;
 }
@@ -635,8 +659,10 @@ int parse_u2fhid_packet(const uint8_t *data)
         /* Init packet. Start a new buffer. */
         ip = (const struct u2fhid_init_packet *)gp;
         len = (uint16_t)((uint16_t)(ip->payload_len[0]) << 8U) + ip->payload_len[1];
-        if (len > U2FHID_MAX_PAYLOAD)
+        if (len > U2FHID_MAX_PAYLOAD) {
+            ctaphid_send_error(ip->cid, CTAPHID_ERR_INVALID_LEN);
             return EWRONGLEN;
+        }
 
         memset(&U2F_Message, 0, sizeof(struct u2f_message));
         U2F_Message.len = len;
@@ -672,13 +698,13 @@ int parse_u2fhid_packet(const uint8_t *data)
         U2F_Message.rx_len = U2F_Message.len;
     if (U2F_Message.rx_len == U2F_Message.len) {
         /* Finally parse the raw packet */
+        uint32_t cid = U2F_Message.cid;
         uint16_t ret = parse_u2f_raw();
         if (ret != ENOERR) {
-            uint8_t reply[U2FHID_PACKET_SIZE];
+            /* Defensive: parse_u2f_raw() now reports its own errors, so this
+             * should not trigger. Never send an unformatted buffer here. */
             memset(&U2F_Message, 0, sizeof(struct u2f_message));
-            reply[0] = (uint8_t)(ret & 0xFF00U) >> 8U;
-            reply[1] = ret & 0xFFU;
-            tud_hid_report(0, reply, U2FHID_PACKET_SIZE);
+            ctaphid_send_error(cid, CTAPHID_ERR_OTHER);
         }
     }
     return 0;
