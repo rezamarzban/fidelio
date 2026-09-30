@@ -42,16 +42,18 @@ run: cose_wire_test
 # per-device uniqueness, caching and the rebuild after a secret rotation;
 # the openssl pass says the DER is a real certificate and that its public
 # key is the one att_key_init derives.
-CG_SRC   ?= /tmp/wolfssl-certgen
+WOLFSSL_CERTGEN_SRC   ?= /tmp/wolfssl-certgen
 
 att_test:
-	@if [ -f "$(CG_SRC)/src/.libs/libwolfssl.a" ]; then \
+	@if [ -f "$(WOLFSSL_CERTGEN_SRC)/src/.libs/libwolfssl.a" ]; then \
+		set -e; \
 		TMP=$$(mktemp -d); \
+		trap 'rm -rf $$TMP' EXIT; \
 		cp $(TOP)/src/att.c $(TOP)/src/att.h $$TMP/; \
 		printf '#ifndef DEVICE_STATE_H\n#define DEVICE_STATE_H\n#include <stdint.h>\nconst uint8_t *device_get_secret(void);\n#endif\n' > $$TMP/device_state.h; \
 		$(CC) -Wall -Wextra -DWOLFSSL_USE_OPTIONS_H -DForceZero=wc_ForceZero \
-			-I"$(CG_SRC)" -I$$TMP att_test.c $$TMP/att.c \
-			"$(CG_SRC)/src/.libs/libwolfssl.a" -o $$TMP/att_test; \
+			-I"$(WOLFSSL_CERTGEN_SRC)" -I$$TMP att_test.c $$TMP/att.c \
+			"$(WOLFSSL_CERTGEN_SRC)/src/.libs/libwolfssl.a" -o $$TMP/att_test; \
 		(cd $$TMP && ./att_test); \
 		for c in att_test_cert att_test_cert_rotated; do \
 			openssl x509 -in $$TMP/$$c.der -inform der -out $$TMP/$$c.pem; \
@@ -65,10 +67,9 @@ att_test:
 			esac; \
 			cmp $$TMP/$$c.pub $$want; \
 		done; \
-		rm -rf $$TMP; \
 		echo "att_test: certificates parse, self-signatures verify, keys match"; \
 	else \
-		echo "att_test: SKIPPED (no certgen host wolfSSL at $(CG_SRC); set WOLFSSL_CERTGEN_SRC)"; \
+		echo "att_test: SKIPPED (no certgen host wolfSSL at $(WOLFSSL_CERTGEN_SRC); set WOLFSSL_CERTGEN_SRC)"; \
 	fi
 
 clean:

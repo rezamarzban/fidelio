@@ -185,22 +185,25 @@ static int att_set_serial(Cert *cert, ecc_key *key)
 
 static void att_set_name(Cert *cert)
 {
-    /* Same distinguished name the retired development certificate carried, so
-     * only the key material changes per unit. wc_MakeCert copies the subject
-     * into the issuer for a self-signed certificate, so only the subject is
-     * filled here.
+    /* The development certificate's distinguished name, with the
+     * organizational unit set to the value WebAuthn packed attestation
+     * requires. wc_MakeCert copies the subject into the issuer for a
+     * self-signed certificate, so only the subject is filled here.
      */
     strcpy(cert->subject.country, "ZZ");
     strcpy(cert->subject.state, "StateName");
     strcpy(cert->subject.locality, "CityName");
+    strcpy(cert->subject.unit, "Authenticator Attestation");
     strcpy(cert->subject.org, "Fidelio-U2F");
-    strcpy(cert->subject.unit, "Fidelio");
     strcpy(cert->subject.commonName, "U2F-HID");
 }
 
 static int att_cert_build(WC_RNG *rng)
 {
-    ecc_key key;
+    /* Static: an ecc_key local would put an 800+ byte frame on a 4 KB
+     * stack that already carries the fido_register chain above us.
+     * Single-threaded firmware; zeroed on every exit path. */
+    static ecc_key key;
     Cert *cert;
     int body, ret = -1;
 

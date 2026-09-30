@@ -5,7 +5,7 @@
  *   ./configure --enable-cryptonly --enable-ecc --enable-certgen \
  *               --enable-certext --enable-keygen --enable-hkdf \
  *               CFLAGS="-DWOLFSSL_EKU_OID -DHAVE_OID_ENCODING"
- * run_host_tests.sh skips this test when no such build is present.
+ * make -C tests att_test skips this test when no such build is present.
  */
 #include <stdio.h>
 #include <string.h>

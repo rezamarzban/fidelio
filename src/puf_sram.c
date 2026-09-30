@@ -56,7 +56,7 @@ extern void ForceZero(void* mem, word32 len);
 #define PUF_CODE_ENROLLED     1 /* enrolled, power-cycle to verify */
 #define PUF_CODE_RECONSTRUCT  2 /* reconstruction failed, power-cycle to retry */
 #define PUF_CODE_CONFIG       3 /* build or memory-map fault, not retryable */
-#define PUF_CODE_MAC          4 /* checkpoint MAC mismatch, not retryable */
+#define PUF_CODE_MAC          4 /* checkpoint MAC mismatch, power-cycle to retry */
 
 /* HKDF info: a fixed label binding the key to this use, followed by a salt
  * drawn once per enrollment.
@@ -175,12 +175,12 @@ static void __not_in_flash_func(puf_write_checkpoint)(uint32_t magic,
     cp->profileId = (uint32_t)WC_PUF_PROFILE_ID;
     memcpy(cp->salt, salt, PUF_SALT_SZ);
     memcpy(cp->helper, helper, WC_PUF_HELPER_BYTES);
-    /* HKDF and HMAC cannot realistically fail here; a failure writes an
-     * all-zero MAC so the next boot halts on mismatch instead of silently
-     * downgrading to the legacy all-0xFF acceptance.
+    /* HKDF and HMAC cannot realistically fail here; a failure leaves the
+     * existing checkpoint in place rather than erasing it and writing an
+     * unsigned record.
      */
     if (puf_cp_mac(cp, secret, cp->mac) != 0)
-        memset(cp->mac, 0, PUF_MAC_SZ);
+        return;
     fidelio_flash_erase(FLASH_PUF_OFF, FLASH_SECTOR_SIZE);
     fidelio_flash_program(FLASH_PUF_OFF, page, sizeof(page));
     ForceZero(page, sizeof(page));
@@ -625,15 +625,16 @@ int puf_provision(void)
             puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
         {
             int m = puf_cp_mac_check(cp, master_secret);
-            if (m == 1) {
-                /* Legacy checkpoint from a pre-MAC firmware: accept once and
-                 * re-sign it, closing the window. A flash writer could have
-                 * planted a legacy-format checkpoint anyway, so the
-                 * migration grants no new capability.
-                 */
-                puf_write_checkpoint(PUF_MAGIC_COMMITTED, cp->salt,
-                                     cp->helper, master_secret);
-            } else if (m != 0)
+            /* m == 1: legacy all-0xFF field from a pre-MAC firmware. Accepted
+             * without rewriting: re-signing would erase the only copy of the
+             * helper data on the first boot after the update, and a power
+             * loss mid-erase would leave the device with no checkpoint at
+             * all. Legacy acceptance is permanent, which is deliberate - a
+             * flash writer who can plant an all-0xFF record can replace the
+             * firmware too, so the MAC guards the records this firmware
+             * writes, not the ones it inherits.
+             */
+            if (m != 0 && m != 1)
                 puf_halt(PUF_CODE_MAC, 0x20, 0, 0x20);
         }
         return 0;
@@ -657,12 +658,17 @@ int puf_provision(void)
             if (ret != 0)
                 puf_halt(PUF_CODE_CONFIG, 0x20, 0, 0);
             m = puf_cp_mac_check(cp, master_secret);
-            if (m != 0 && m != 1)
-                puf_halt(PUF_CODE_MAC, 0x20, 0, 0x20);
-            puf_write_checkpoint(PUF_MAGIC_COMMITTED, salt, helper,
-                                 master_secret);
-            ForceZero(helper, sizeof(helper));
-            return 0;
+            if (m == 0 || m == 1) {
+                puf_write_checkpoint(PUF_MAGIC_COMMITTED, salt, helper,
+                                     master_secret);
+                ForceZero(helper, sizeof(helper));
+                return 0;
+            }
+            /* MAC mismatch: the checkpoint is not what this device wrote.
+             * Same situation as a failed verification below: nothing has
+             * been registered against this device yet, so discard the
+             * attempt and enroll again.
+             */
         }
         /* Verification failed. Nothing has been registered against this
          * device yet, so discarding the attempt and enrolling again costs

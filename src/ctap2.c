@@ -319,11 +319,17 @@ static int pin_generate_agreement_key(WC_RNG *rng)
         wc_ecc_free(&pin_agree_key);
         wc_ecc_init(&pin_agree_key);
     }
-    if (wc_ecc_make_key_ex(rng, ECC_SZ, &pin_agree_key, ECC_SECP256R1) != 0)
+    if (wc_ecc_make_key_ex(rng, ECC_SZ, &pin_agree_key, ECC_SECP256R1) != 0) {
+        wc_ecc_free(&pin_agree_key);
+        pin_agree_valid = false;
         return -1;
+    }
     word32 qxlen = ECC_SZ, qylen = ECC_SZ;
-    if (wc_ecc_export_public_raw(&pin_agree_key, pin_agree_qx, &qxlen, pin_agree_qy, &qylen) != 0)
+    if (wc_ecc_export_public_raw(&pin_agree_key, pin_agree_qx, &qxlen, pin_agree_qy, &qylen) != 0) {
+        wc_ecc_free(&pin_agree_key);
+        pin_agree_valid = false;
         return -1;
+    }
     pin_agree_valid = true;
     pin_agree_consumed = false;
     return 0;
@@ -350,8 +356,10 @@ static int pin_shared_secret(const uint8_t *peer_x, const uint8_t *peer_y, uint8
     if (ret != 0)
         goto out;
     /* Protocol 1: sharedSecret = SHA256(ECDH), used for both HMAC and AES keys */
-    if (wc_Sha256Hash(ecdh, ecdh_len, ss) != 0)
+    if (wc_Sha256Hash(ecdh, ecdh_len, ss) != 0) {
+        ret = -1;
         goto out;
+    }
     memcpy(secret_out, ss, HASH_SZ);
     memcpy(secret_out + HASH_SZ, ss, HASH_SZ);
     ret = 0;
@@ -1359,6 +1367,11 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     if (att_key_init(&cert_ecc) != 0) {
         ret = -1; goto cleanup;
     }
+    /* Before the rk block: a cert failure must not leave an orphaned
+     * discoverable credential in the vault. */
+    if (att_cert_get(&rng, &att_der, &att_der_len) != 0) {
+        ret = -1; goto cleanup;
+    }
     if (cred_alg_derive(alg, device_get_secret(), rpIdHash, credId + 1,
                         &user_key) != 0) {
         ret = -1; goto cleanup;
@@ -1390,10 +1403,6 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
             ret = CTAP2_ERR_KEY_STORE_FULL; goto cleanup;
         }
         ForceZero(&rec, sizeof(rec));
-    }
-
-    if (att_cert_get(&rng, &att_der, &att_der_len) != 0) {
-        ret = -1; goto cleanup;
     }
 
     uint8_t flags = 0x41;

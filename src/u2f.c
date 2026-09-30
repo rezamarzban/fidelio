@@ -292,7 +292,10 @@ static void p256_reduce_scalar(uint8_t *s)
 {
     uint32_t i;
     uint32_t a, sub, borrow;
-    int ge = 0;
+    /* ge starts true so s == n counts as >= n and reduces to 0, which the
+     * key import then rejects; every other case is decided by the first
+     * differing byte. */
+    int ge = 1;
 
     for (i = 0; i < 32; i++) {
         if (s[i] != P256_ORDER[i]) {
@@ -337,6 +340,10 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     WC_RNG rng;
     challenge = U2F_Message.data + sizeof(struct u2f_raw_hdr);
     application = U2F_Message.data + sizeof(struct u2f_raw_hdr) + PARAM_SZ;
+    /* Zeroed so the cleanup path can free them on every route, including
+     * one that failed before the initialiser ran. */
+    memset(&user_ecc, 0, sizeof(user_ecc));
+    memset(&cert_ecc, 0, sizeof(cert_ecc));
     (void)hdr;
     (void)len;
 
@@ -453,9 +460,10 @@ static uint16_t fido_register(struct u2f_raw_hdr *hdr, uint16_t len)
     idx += HASH_SZ;
     /* Copy attestation certificate into reply. Its length is decided at
      * runtime now, so check it against the buffer rather than trusting a
-     * compile-time constant.
+     * compile-time constant; the +2 is the 0x9000 status word
+     * ctaphid_send() appends.
      */
-    if (idx + att_der_len + siglen > sizeof(U2F_cmd_reply)) {
+    if (idx + att_der_len + siglen + 2 > sizeof(U2F_cmd_reply)) {
         sw = 0x6113;
         goto cleanup;
     }
@@ -505,6 +513,9 @@ static uint16_t fido_auth(struct u2f_raw_hdr *hdr, uint16_t len)
     handle_sz = msg_data[PARAM_SZ + PARAM_SZ];
     handle_nonce = msg_data + PARAM_SZ + PARAM_SZ + 1;
     handle_hash = msg_data + PARAM_SZ + PARAM_SZ + 1 + NONCE_SZ;
+    /* Zeroed so the cleanup path can free it on every route, including one
+     * that failed before the initialiser ran. */
+    memset(&user_ecc, 0, sizeof(user_ecc));
 
     switch (control) {
         case 0x07: /* "check-only" */
