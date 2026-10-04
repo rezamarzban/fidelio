@@ -1,193 +1,156 @@
-# Fidelio
+# Fidelio (ATECC Support)
 
-## Turn a rp2040 into a personal authentication key
+Fidelio turns a Raspberry Pi RP2040 board into a personal USB security key supporting **FIDO2 / WebAuthn** and legacy **CTAP1 / U2F**.
 
-Universal FIDO2/U2F key using Raspberry Pi Pico (rp2040) and wolfCrypt. Works with
-any raspberry-pi pico device with only one component added (pushbutton on GPIO15).
+This branch (`atecc-support`) contains a series of security hardening patches (0001–0014) applied on top of upstream commit `dbb05f0`.
 
-### Goals and security model
+> **Important**  
+> This is **not** the same as upstream `master`. Several features and the security model have been deliberately changed. Read this document and `SECURITY.md` / `SE.md` carefully before using.
 
-Fidelio implements a FIDO2 authenticator (CTAP2/WebAuthn) with CTAP1/U2F
-compatibility, generally used as second factor in 2FA services, or in some
-specific cases for password-less authentication.
+## What this version supports
 
-Associating a 2FA authentication service to a hardware key as second factor will
-require the user to provide the key to prove that they are still in possess of
-the hardware key that was initially registered.
+- CTAP2 / FIDO2 and WebAuthn
+- Legacy CTAP1 / U2F
+- Physical user presence via a push-button
+- FIDO2 PIN (with physical presence required for setting)
+- Unlimited non-discoverable credentials
+- ES256 signatures
+- Optional **Secure Element** mode using Microchip ATECC608A/B/C
 
-The holder of the key can only prove the physical presence of the key during an
-authentication procedure. This is done by connecting it via USB and pushing a button.
+### What was removed / disabled
 
-Through this mechanism, the authenticator is given a proof that the
-request has been processed (signed) by the same key initially registered, so the
-user can be trusted as the authenticator assumes that the user is still holding
-the key.
+- Discoverable credentials (passkeys / resident keys) — `rk=true` is rejected
+- U2F “sign without presence”
+- Dead FDO / resident-key code paths
 
-Two-factor authentication based on FIDO mechanisms is generally considered more secure than time-based
-OTP services, like mobile apps or other devices that require clock synchronization with the
-authenticating party.
+## Security model (summary)
 
-The device creates a unique private key, which is then used to derive the keys for the
-authenticating services requesting a FIDO authentication. This means that Fidelio does
-not pose any storage limitation on the number of authentication services that can be
-registered, as the same key is derived again whenever needed and it's never stored on
-the device. CTAP1/U2F remains supported for legacy services; CTAP2/WebAuthn is the
-primary protocol.
+- By default the root secret lives in flash (software mode).
+- With the Secure Element jumper fitted, the root secret stays **inside the ATECC608** and never leaves the chip. All key derivation is performed by the secure element.
+- CTAP2 `authenticatorReset` now **rotates the master key**, invalidating every existing credential.
+- First boot with the SE jumper permanently destroys the software master key.
+- The RP2040 still has no flash encryption or secure boot. A stolen device can be dumped.
 
-The codebase is simple and rather small, allowing for an easy full audit of the security
-model and the related implementations.
+See `SECURITY.md` for the full list of fixes and residual risks, and `SE.md` for Secure Element details.
 
+## Hardware requirements
 
-### Security considerations
+- Raspberry Pi Pico (or compatible RP2040 board)
+- One normally-open push-button (presence button)
+- **Optional**: Microchip ATECC608A/B/C + jumper for Secure Element mode
 
-The security of Fidelio depends entirely on the physical presence of the hardware. If Fidelio is lost
-or stolen, the second factor of all the registered services must be considered compromised, and the
-keys associated to the device should be revoked from all the associated services. This usually does
-not represent an important security risk in itself, as long as a first factor is in use (commonly,
-password authentication).
+### Presence button (required)
 
-A rp2040 board running Fidelio will not store any credentials or traces that can be associated
-with any running server. The only two pieces of information stored in the target's FLASH memory
-are the device's master key, generated on first use, and counters keeping track
-of crypto operations, as mandated by the FIDO protocols.
+| Board              | Presence button | LED          |
+|--------------------|-----------------|--------------|
+| Raspberry Pi Pico  | GPIO15          | On-board LED |
 
-### Hardware requirements
+### Secure Element wiring (optional)
 
-FIDO/U2F mandates the use of a single button to indicate that the user is
-actually present when the key is used. Without this button the authenticator
-will never assert user presence.
+| ATECC608     | Pico pin      | Notes                              |
+|--------------|---------------|------------------------------------|
+| VCC / GND    | 3V3 / GND     |                                    |
+| SDA / SCL    | GP4 / GP5     | 4.7 kΩ pull-ups recommended        |
+| **Jumper**   | **GP6 ↔ GP7** | Must be present **at power-up**    |
 
-For this purpose, Fidelio requires a normally-open push-button between GPIO15
-and GND.
+Default I2C address is `0x60`. Change with `-DSE_I2C_ADDR=...` if needed.
 
-On the Raspberry-pi pico board, this button can normally be soldered in place:
+**Warning:** The first boot with the SE jumper fitted permanently erases the software master key. All previous software-mode registrations are lost.
 
-![Raspberry Pico soldering](doc/raspi_mod_button.png)
+## Quick start
 
+### 1. Clone and prepare
 
-If you are using a different model and/or you want to change the pin for the
-presence button and LED, just edit [pins.h](src/pins.h) and change the pin number
-defined by the macro `PRESENCE_BUTTON` and `U2F_LED`, respectively.
-
-
-### Build and flash:
-
-1. Clone this repository, create and populate build directory
-
-```
-git clone https://github.com/danielinux/fidelio.git
+```sh
+git clone --recursive https://github.com/rezamarzban/fidelio.git
 cd fidelio
-git submodule update --init --single-branch pico-sdk lib/wolfssl
-cd pico-sdk
-git submodule update --init --single-branch lib/tinyusb
-cd ..
-
+git checkout atecc-support
 ```
 
-2. Create your own attestation certificate.
-This is required only once. The certificate generate will univocally identify your
-device.
+If you already cloned without submodules:
 
-You may change/customize the details in the certificate by editing the `mkcert.sh`
-script.
-
+```sh
+git submodule update --init --recursive
+# CryptoAuthLib is present only as a reference (not linked into the firmware)
+git submodule update --init --depth 1 lib/cryptoauthlib
 ```
+
+### 2. Create your attestation certificate
+
+```sh
 ./mkcert.sh
 ```
 
-3. Configure CMake (pass the full absolute path to pico-sdk):
+### 3. Build
 
-```
-cmake -B build -DPICO_COPY_TO_RAM=1 -DFAMILY=rp2040 -DPICO_SDK_PATH=/path/to/fidelio/pico-sdk
-```
-
-4. Compile:
-
-```
+```sh
+cmake -B build -DFAMILY=rp2040 -DPICO_SDK_PATH=$PWD/pico-sdk
 cmake --build build
 ```
 
-5. Flash to the Pico (hold BOOTSEL when plugging in, then copy):
+The build forces a `copy_to_ram` layout and fails if the image grows into the key/counter flash region.
 
-```
-cp build/fidelio.uf2 /path/to/RPI-RP2
-```
+### 4. Flash
 
+Hold **BOOTSEL**, plug in the Pico, then copy the UF2:
 
-### First run: generating the master key
-
-The first time the device is plugged in into the computer, it will randomly generate its master key.
-The master key will be then used, for the entire lifetime of the device, to generate
-keys for single FIDO services.
-
-Updating the Fidelio firmware to a newer version will not overwrite the master key,
-so the key will keep working with services that had been registered with the old
-firmware as well.
-
-On first boot the LED will stay on while the master key is generated; press the
-presence button once to acknowledge, then the device will reboot automatically.
-
-### Set the FIDO2 PIN
-
-After flashing, set the authenticator PIN:
-
-```
-fido2-token -S /dev/hidrawX    # enter your chosen PIN when prompted
+```sh
+cp build/fidelio.uf2 /path/to/RPI-RP2/
 ```
 
-Replace `/dev/hidrawX` with the device path listed by `fido2-token -L`. Press the
-presence button when prompted during this flow.
+### 5. First boot
 
+- **Software mode** (no jumper): LED stays on while the master key is generated → press the button once.
+- **SE mode** (jumper present): the device verifies the ATECC608. On any failure it blinks an error code (1–7) and never starts USB.
 
+## Everyday use
 
-### Testing
+When a site asks for the security key, connect the device and press the presence button while the LED is lit. Enter the PIN when requested.
 
-#### Online services
+- CTAP2 reset (or recovering from a locked PIN) **invalidates all credentials**. You must re-register afterwards.
+- Reset is only accepted within ~10 seconds of plugging in and requires a button press.
+- Setting a PIN always requires a physical button press.
 
-To ensure that your device is correctly working, connect Fidelio to your PC and
-visit the WebAuthn.io demo: https://webauthn.io/
+## Secure Element mode (optional)
 
-Use “Register” to create a credential (press the presence button when asked, and
-enter the PIN you set above), then “Login” to exercise getAssertion.
+Enabled only when GP6 and GP7 are joined **before power-up**.
 
-### Usage
+| Operation              | Software mode          | SE mode                          |
+|------------------------|------------------------|----------------------------------|
+| Root secret            | In flash               | Inside ATECC608 (never leaves)   |
+| Key derivation         | On RP2040              | Computed by the chip             |
+| Extra entropy          | ADC + ROSC + timer     | + hardware RNG from the chip     |
+| Attestation key / PIN  | Still in flash         | Still in flash                   |
 
-#### Service example: github second factor
+Supported chips: **ATECC608A / 608B / 608C** only (revision byte `0x60`).  
+Other CryptoAuth devices are rejected.
 
-Go to your profile settings. Select "Password and authentication" from the Access menu.
+The driver was cross-checked against Microchip’s CryptoAuthLib (`lib/hal` + `lib/calib`) but has **not** been tested on real silicon yet. Use a spare chip first.
 
-Find the "Two factor authentication" configuration at the bottom of the page. Check the
-"Security Keys" option:
+Full details: see `SE.md`.
 
-![github.com 2FA config](doc/github_register_key.png)
+## LED error codes (Secure Element)
 
-The button "Register new security key" will associate the device running fidelio
-as a second factor to access your github account. Give it a unique name of your
-choice.
+If the jumper is present and something is wrong, the LED blinks N times, pauses, and repeats. USB never starts.
 
-![github.com 2FA security key configured](doc/github_configured.png)
+| Flashes | Meaning                        |
+|---------|--------------------------------|
+| 1       | No device / communication fail |
+| 2       | Not an ATECC608                |
+| 3       | Config/data zones not locked   |
+| 4       | Secret slot is readable        |
+| 5       | Secret slot appears blank      |
+| 6       | HMAC self-test failed          |
+| 7       | Chip serial number mismatch    |
 
-It is a good idea to configure more than one 2FA mechanism to your account to
-avoid the risk of being locked out of your account. This of course includes the
-possibility to use more than one fidelio hardware keys, stored in different places.
+## Documentation
 
-#### Local PAM services
+- `SECURITY.md` – what was fixed, behaviour changes, residual risks
+- `SE.md` – Secure Element mode, wiring, limits, provisioning notes
+- `tests/README.txt` – host-side test suite
 
-To test on a linux machine, install `libpam-u2f` and `pamu2fcfg`.
+## License
 
-With the command `pamu2fcfg` you can register a new key associated to your device.
-See `man pamu2fcfg` for information about command line options.
+Fidelio is licensed under the **GNU General Public License v2** (or later, depending on upstream files).
 
-The package `libpam-u2f` provides a module for PAM. Keys created with pamu2fcfg
-can be used as extra (or sole) authentication step for any pam service in `/etc/pam.d`.
-
-It is possible for example to configure password-less login, `sudo`, or other
-operations by setting the u2f module as `sufficient` in the corresponding pam.d
-file, or as extra authentication step, if the keyword `required` is used, instead.
-
-For more information about configuring your services to use libpam-u2f, see the
-libpam-u2f documentation (available via `man pam_u2f`).
-
-**Ensure you always keep a root console open when changing pam.d configuration, and
-to test your changes properly after each change, to avoid locking yourself out of
-your machine**
+CryptoAuthLib is present only as a **git submodule for reference and provisioning tools**. It is **not** compiled into the firmware. Microchip’s licence restricts use to Microchip products; linking it into a distributed binary would create a licence conflict. See the note in `SE.md`.
