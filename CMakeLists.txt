@@ -25,8 +25,8 @@ target_sources(${PROJECT} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/rand.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cert.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ctap2.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/fdo.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/u2f.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/se.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/usb_descriptors.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/asn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/wolfssl/wolfcrypt/src/wc_port.c
@@ -61,8 +61,20 @@ target_include_directories(${PROJECT} PUBLIC
         target_link_libraries(${PROJECT} PUBLIC pico_stdlib)
         target_link_libraries(${PROJECT} PUBLIC pico_multicore)
         target_link_libraries(${PROJECT} PUBLIC hardware_adc)
+        target_link_libraries(${PROJECT} PUBLIC hardware_i2c)
         target_link_libraries(${PROJECT} PUBLIC hardware_flash)
 
 # Configure compilation flags and libraries for the example... see the corresponding function
 # in hw/bsp/FAMILY/family.cmake for details.
 family_configure_device_example(${PROJECT})
+
+# Flash writes (counter, master key, PIN) run from RAM; a build that executes
+# from flash would stall/crash during them.  Force the RAM-resident layout
+# whatever the configure command line says.
+pico_set_binary_type(${PROJECT} copy_to_ram)
+
+# Keep the image clear of the persistent-data sectors starting at 0x70000.
+add_custom_command(TARGET ${PROJECT} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -DBIN=$<TARGET_FILE_DIR:${PROJECT}>/${PROJECT}.bin
+            -DLIMIT=0x70000 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_flash_size.cmake
+    COMMENT "Checking firmware size against the persistent-data area")

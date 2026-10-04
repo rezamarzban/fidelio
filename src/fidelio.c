@@ -26,14 +26,28 @@
 #include "hardware/adc.h"
 #include "bsp/board.h"
 #include "pins.h"
+#include "se.h"
+#include "device_state.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
 #include "user_settings.h"
 #include "wolfssl/wolfcrypt/settings.h"
 #include "hardware/clocks.h"
-#include "fdo.h"
     
 extern void u2f_init(void);
+
+/* Secure element requested but unusable: blink the reason (1..7 flashes) forever.
+ * Never fall back to software crypto, never enumerate on USB. */
+static void se_fail(int code)
+{
+    for (;;) {
+        for (int i = 0; i < code; i++) {
+            gpio_put(U2F_LED, 1); sleep_ms(150);
+            gpio_put(U2F_LED, 0); sleep_ms(250);
+        }
+        sleep_ms(1500);
+    }
+}
 
 void system_boot(void)
 {
@@ -48,9 +62,20 @@ void system_boot(void)
     gpio_set_dir(PRESENCE_BUTTON, GPIO_IN);
     gpio_pull_up(PRESENCE_BUTTON);
 
+    /* Two pins joined by a jumper at power-up = use the secure element */
+    if (se_jumper_present()) {
+        int e = se_init();
+        if (e != SE_OK)
+            se_fail(e);
+    }
+
     /* Initializing U2F parser */
     u2f_init();
-    fdo_init();
+    if (se_active()) {
+        int e = device_se_check();
+        if (e != SE_OK)
+            se_fail(e);
+    }
 
     /* Initializing TinyUSB device */
     tusb_init();

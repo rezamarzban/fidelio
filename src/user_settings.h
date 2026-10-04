@@ -38,6 +38,9 @@ extern int custom_random_seed(unsigned char* output, unsigned int sz);
 //#define WOLFSSL_ASN_TEMPLATE
 
 #define HAVE_ECC
+/* RFC 6979 deterministic nonces: a weak/biased RNG can no longer leak a
+ * signing key through repeated or predictable ECDSA nonces. */
+#define WOLFSSL_ECDSA_DETERMINISTIC_K
 #   define ECC_TIMING_RESISTANT
 //#   define ECC_USER_CURVES /* enables only 256-bit by default */
 /* ECC options disabled to reduce size */
