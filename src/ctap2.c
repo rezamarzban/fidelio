@@ -12,13 +12,15 @@
 #include "wolfssl/wolfcrypt/asn.h"
 #include "wolfssl/wolfcrypt/random.h"
 #include "wolfssl/wolfcrypt/kdf.h"
-#include "cert.h"
+#include "se.h"
+#include "cred_store.h"
+#include "att_cert.h"
+#include "hw_sign.h"
 #include "pins.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/flash.h"
 #include "wolfssl/wolfcrypt/aes.h"
-#include "fdo.h"
 
 extern void ForceZero(void* mem, word32 len);
 
@@ -34,6 +36,17 @@ extern void ForceZero(void* mem, word32 len);
 #define CTAP2_ERR_PIN_BLOCKED        0x34
 #define CTAP2_ERR_PIN_NOT_SET        0x35
 #define CTAP2_ERR_PIN_AUTH_INVALID   0x33
+#define CTAP2_ERR_USER_ACTION_TIMEOUT 0x2F
+#define CTAP2_ERR_NOT_ALLOWED        0x30
+#define CTAP2_ERR_UNSUPPORTED_OPTION 0x2B
+#define CTAP2_ERR_OTHER              0x7F
+#define CTAP2_ERR_KEY_STORE_FULL     0x28
+#define CTAP2_ERR_PIN_POLICY_VIOLATION 0x37
+
+/* authenticatorReset is only honoured shortly after power-up (as the spec
+ * requires) and only with a physical button press. 0 disables the window. */
+#define RESET_WINDOW_MS   10000u
+#define PIN_MIN_LEN       4
 
 #define CTAP2_CMD_MAKE_CREDENTIAL    0x01
 #define CTAP2_CMD_GET_ASSERTION      0x02
@@ -62,11 +75,16 @@ extern void ForceZero(void* mem, word32 len);
 #define FLASH_PIN_OFF      0x73000
 #define FLASH_PIN_MAGIC    0x50494E21 /* 'PIN!' */
 #define PIN_MAX_RETRIES    8
-#define FLASH_RK_OFF       0x74000
-#define FLASH_RK_MAGIC     0x524B2121 /* 'RK!!' */
-#define RK_MAX_SLOTS       8
 
 #define CTAP2_CMD_RESET           0x07
+
+static int ct_memeq(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; i++)
+        diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0;
+}
 
 struct cbor_buf {
     uint8_t *buf;
@@ -184,8 +202,14 @@ static int cbor_read_hdr(const uint8_t *buf, uint16_t len, uint8_t *major, uint3
     return 0;
 }
 
-static int cbor_skip(const uint8_t *buf, uint16_t len, uint16_t *consumed)
+/* Nesting is bounded: this function recurses on the (attacker-chosen) depth of
+ * the CBOR input, and an unbounded recursion overruns the 8 KB-class stack. */
+#define CBOR_MAX_DEPTH 8
+
+static int cbor_skip_d(const uint8_t *buf, uint16_t len, uint16_t *consumed, int depth)
 {
+    if (depth > CBOR_MAX_DEPTH)
+        return -1;
     uint8_t major;
     uint32_t val;
     uint16_t hdr_len;
@@ -212,7 +236,7 @@ static int cbor_skip(const uint8_t *buf, uint16_t len, uint16_t *consumed)
             uint16_t total = hdr_len;
             for (uint32_t i = 0; i < val; i++) {
                 uint16_t inner = 0;
-                if (cbor_skip(p, remain, &inner) != 0)
+                if (cbor_skip_d(p, remain, &inner, depth + 1) != 0)
                     return -1;
                 total += inner;
                 if (remain < inner)
@@ -227,14 +251,14 @@ static int cbor_skip(const uint8_t *buf, uint16_t len, uint16_t *consumed)
             uint16_t total = hdr_len;
             for (uint32_t i = 0; i < val; i++) {
                 uint16_t inner = 0;
-                if (cbor_skip(p, remain, &inner) != 0)
+                if (cbor_skip_d(p, remain, &inner, depth + 1) != 0)
                     return -1;
                 total += inner;
                 if (remain < inner)
                     return -1;
                 p += inner;
                 remain = (uint16_t)(remain - inner);
-                if (cbor_skip(p, remain, &inner) != 0)
+                if (cbor_skip_d(p, remain, &inner, depth + 1) != 0)
                     return -1;
                 total += inner;
                 if (remain < inner)
@@ -250,6 +274,11 @@ static int cbor_skip(const uint8_t *buf, uint16_t len, uint16_t *consumed)
     }
 }
 
+static int cbor_skip(const uint8_t *buf, uint16_t len, uint16_t *consumed)
+{
+    return cbor_skip_d(buf, len, consumed, 0);
+}
+
 static int cbor_read_bytes(const uint8_t *buf, uint16_t len, const uint8_t **out, uint32_t *out_len, uint16_t *consumed)
 {
     uint8_t major;
@@ -259,7 +288,7 @@ static int cbor_read_bytes(const uint8_t *buf, uint16_t len, const uint8_t **out
         return -1;
     if (major != 2)
         return -1;
-    if (len < hdr_len + val)
+    if (val > (uint32_t)(len - hdr_len)) /* no 32-bit wrap-around */
         return -1;
     *out = buf + hdr_len;
     *out_len = val;
@@ -276,7 +305,7 @@ static int cbor_read_text(const uint8_t *buf, uint16_t len, const uint8_t **out,
         return -1;
     if (major != 3)
         return -1;
-    if (len < hdr_len + val)
+    if (val > (uint32_t)(len - hdr_len)) /* no 32-bit wrap-around */
         return -1;
     *out = buf + hdr_len;
     *out_len = val;
@@ -310,81 +339,12 @@ static uint8_t pin_agree_qy[ECC_SZ];
 static bool pin_agree_valid = false;
 static bool pin_agree_consumed = true;
 
-struct rk_slot {
-    uint8_t magic[4];
-    uint8_t rpIdHash[HASH_SZ];
-    uint8_t user_handle[32];
-    uint8_t cred_id[NONCE_SZ + HASH_SZ];
-    uint16_t cred_id_len;
-    uint8_t pub_qx[ECC_SZ];
-    uint8_t pub_qy[ECC_SZ];
-    uint32_t counter;
-};
-
-static struct rk_slot rk_slots[RK_MAX_SLOTS];
-static bool rk_loaded = false;
-
-static void rk_load(void)
-{
-    if (rk_loaded)
-        return;
-    const struct rk_slot *flash_rk = (const struct rk_slot *)(XIP_BASE + FLASH_RK_OFF);
-    memcpy(rk_slots, flash_rk, sizeof(rk_slots));
-    rk_loaded = true;
-}
-
-static void rk_save(void)
-{
-    flash_range_erase(FLASH_RK_OFF, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_RK_OFF, (const uint8_t *)rk_slots, sizeof(rk_slots));
-}
-
-static int rk_find_free(void)
-{
-    for (int i = 0; i < RK_MAX_SLOTS; i++) {
-        if (memcmp(rk_slots[i].magic, (uint8_t[4]){0}, 4) == 0)
-            return i;
-    }
-    return -1;
-}
-
-static int rk_find_match(const uint8_t *rpIdHash, const uint8_t *cred_id, uint16_t cred_len)
-{
-    for (int i = 0; i < RK_MAX_SLOTS; i++) {
-        if (memcmp(rk_slots[i].magic, (uint8_t[4]){ 'R','K','!','!' }, 4) != 0)
-            continue;
-        if (rk_slots[i].cred_id_len == cred_len &&
-            memcmp(rk_slots[i].rpIdHash, rpIdHash, HASH_SZ) == 0 &&
-            memcmp(rk_slots[i].cred_id, cred_id, cred_len) == 0)
-            return i;
-    }
-    return -1;
-}
-
-static int rk_find_first_for_rp(const uint8_t *rpIdHash)
-{
-    for (int i = 0; i < RK_MAX_SLOTS; i++) {
-        if (memcmp(rk_slots[i].magic, (uint8_t[4]){ 'R','K','!','!' }, 4) != 0)
-            continue;
-        if (memcmp(rk_slots[i].rpIdHash, rpIdHash, HASH_SZ) == 0)
-            return i;
-    }
-    return -1;
-}
-
 static void pin_state_reset(void)
 {
     memset(&pin_store, 0, sizeof(pin_store));
     pin_loaded = false;
     pin_token_valid = false;
     flash_range_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
-}
-
-static void rk_reset(void)
-{
-    memset(rk_slots, 0, sizeof(rk_slots));
-    rk_loaded = false;
-    flash_range_erase(FLASH_RK_OFF, FLASH_SECTOR_SIZE);
 }
 
 static void pin_state_load(void)
@@ -405,7 +365,7 @@ static void pin_state_save(void)
 {
     pin_store.magic = FLASH_PIN_MAGIC;
     flash_range_erase(FLASH_PIN_OFF, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_PIN_OFF, (const uint8_t *)&pin_store, sizeof(pin_store));
+    flash_program_padded(FLASH_PIN_OFF, &pin_store, sizeof(pin_store));
 }
 
 static void pin_reset_token(WC_RNG *rng)
@@ -472,8 +432,16 @@ static int pin_shared_secret(const uint8_t *peer_x, const uint8_t *peer_y, uint8
     uint8_t z[32];
     if (!pin_agree_valid || pin_agree_consumed)
         return -1;
+    /* One attempt per agreement key, whatever the outcome. */
+    pin_agree_consumed = true;
     wc_ecc_init(&peer);
     ret = wc_ecc_import_unsigned(&peer, peer_x, peer_y, NULL, ECC_SECP256R1);
+    if (ret == 0) {
+        /* The import does not validate the point (WOLFSSL_VALIDATE_ECC_IMPORT
+         * is off): reject points that are not on the curve, which would
+         * otherwise feed an invalid-curve attack on the ECDH key. */
+        ret = wc_ecc_check_key(&peer);
+    }
     if (ret != 0) {
         wc_ecc_free(&peer);
         return -1;
@@ -559,7 +527,10 @@ static int pin_check_retries(void)
     return 0;
 }
 
-static void pin_fail_retry(void)
+/* Spend one retry *before* the PIN is compared and persist it: cutting the
+ * power right after a wrong guess can then no longer give a free attempt.
+ * Success restores the counter (callers set retries = PIN_MAX_RETRIES). */
+static void pin_attempt_begin(void)
 {
     if (pin_store.retries > 0) {
         pin_store.retries--;
@@ -576,10 +547,12 @@ static int pin_require_for_op(const uint8_t *pin_auth, uint32_t pin_auth_len,
     if (pin_store.magic != FLASH_PIN_MAGIC) {
         return 0; /* no PIN set */
     }
-    if (!pin_token_valid)
-        return CTAP2_ERR_PIN_NOT_SET;
+    /* A PIN is set. No pinAuth at all -> PIN_REQUIRED; a pinAuth that cannot
+     * be right (no token issued since power-up) -> PIN_AUTH_INVALID. */
     if (!pin_auth || pin_auth_len != 32)
         return CTAP2_ERR_PIN_REQUIRED;
+    if (!pin_token_valid)
+        return CTAP2_ERR_PIN_AUTH_INVALID;
     if (wc_HmacInit(&hmac, NULL, 0) != 0)
         return CTAP2_ERR_PIN_AUTH_INVALID;
     if (wc_HmacSetKey(&hmac, SHA256, pin_token, sizeof(pin_token)) != 0) {
@@ -589,60 +562,10 @@ static int pin_require_for_op(const uint8_t *pin_auth, uint32_t pin_auth_len,
     wc_HmacUpdate(&hmac, cdh, cdh_len);
     wc_HmacFinal(&hmac, mac);
     wc_HmacFree(&hmac);
-    if (memcmp(mac, pin_auth, 32) != 0)
+    if (!ct_memeq(mac, pin_auth, 32))
         return CTAP2_ERR_PIN_AUTH_INVALID;
     return 0;
 }
-static int derive_user_key(const uint8_t *rpIdHash, const uint8_t *nonce,
-                           uint8_t *private_out, uint8_t *handle_hash)
-{
-    Hmac hmac;
-    int ret;
-    const uint8_t *secret = device_get_secret();
-
-    ret = wc_HmacInit(&hmac, NULL, 0);
-    if (ret != 0)
-        return ret;
-    ret = wc_HmacSetKey(&hmac, SHA256, secret, ECC_SZ);
-    if (ret != 0)
-        return ret;
-    wc_HmacUpdate(&hmac, rpIdHash, HASH_SZ);
-    wc_HmacUpdate(&hmac, nonce, NONCE_SZ);
-    wc_HmacFinal(&hmac, private_out);
-    wc_HmacFree(&hmac);
-
-    ret = wc_HmacInit(&hmac, NULL, 0);
-    if (ret != 0)
-        return ret;
-    ret = wc_HmacSetKey(&hmac, SHA256, secret, ECC_SZ);
-    if (ret != 0)
-        return ret;
-    wc_HmacUpdate(&hmac, rpIdHash, HASH_SZ);
-    wc_HmacUpdate(&hmac, private_out, ECC_SZ);
-    wc_HmacFinal(&hmac, handle_hash);
-    wc_HmacFree(&hmac);
-
-    return 0;
-}
-
-static int build_credential_id(WC_RNG *rng, const uint8_t *rpIdHash,
-                               uint8_t *credId, uint16_t credIdCap, uint16_t *credIdLen,
-                               uint8_t *user_private)
-{
-    uint8_t nonce[NONCE_SZ];
-    uint8_t handle_hash[HASH_SZ];
-    if (credIdCap < (NONCE_SZ + HASH_SZ))
-        return -1;
-    if (wc_RNG_GenerateBlock(rng, nonce, NONCE_SZ) != 0)
-        return -1;
-    if (derive_user_key(rpIdHash, nonce, user_private, handle_hash) != 0)
-        return -1;
-    memcpy(credId, nonce, NONCE_SZ);
-    memcpy(credId + NONCE_SZ, handle_hash, HASH_SZ);
-    *credIdLen = NONCE_SZ + HASH_SZ;
-    return 0;
-}
-
 static int encode_cose_pubkey(struct cbor_buf *c, const uint8_t *qx, const uint8_t *qy)
 {
     if (cbor_start_map(c, 5) != 0) return -1;
@@ -809,8 +732,6 @@ struct mc_params {
     const uint8_t *pin_auth;
     uint32_t pin_auth_len;
     int pin_protocol;
-    const uint8_t *user_handle;
-    uint32_t user_handle_len;
     bool rk;
 };
 
@@ -1240,17 +1161,26 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     uint16_t credIdLen = 0;
     uint8_t signature[SIGMAX_SZ];
     word32 siglen = SIGMAX_SZ;
+    uint16_t siglen16 = 0;
+    uint8_t slot = 0, pub[64];
+    uint16_t certlen = 0;
+    const uint8_t *cert;
     uint8_t digest[HASH_SZ];
-    uint8_t user_private[ECC_SZ];
     uint8_t qx[ECC_SZ], qy[ECC_SZ];
     wc_Sha256 sha;
-    WC_RNG rng;
-    ecc_key user_ecc;
-    ecc_key cert_ecc;
     int ret;
 
     if (parse_makecred(payload + 1, payload_len - 1, &params) != 0) {
         reply[0] = CTAP2_ERR_INVALID_CBOR;
+        *reply_len = 1;
+        return 0;
+    }
+
+    /* getInfo advertises rk:false: this key stores no discoverable credentials.
+     * Accepting rk=true used to "succeed" while the credential could never be
+     * found again; refuse it, as CTAP requires for an unsupported option. */
+    if (params.rk) {
+        reply[0] = CTAP2_ERR_UNSUPPORTED_OPTION;
         *reply_len = 1;
         return 0;
     }
@@ -1279,65 +1209,33 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     wc_Sha256Final(&sha, rpIdHash);
     wc_Sha256Free(&sha);
 
-    /* Require user presence */
-    gpio_put(U2F_LED, 1);
-    while (gpio_get(PRESENCE_BUTTON) != 0) {
-        sleep_ms(2);
-    }
-    gpio_put(U2F_LED, 0);
-
-    if (wc_InitRng(&rng) != 0) {
-        reply[0] = CTAP2_ERR_INVALID_COMMAND;
+    /* Require user presence (fresh press, bounded wait) */
+    if (!device_user_presence()) {
+        reply[0] = CTAP2_ERR_USER_ACTION_TIMEOUT;
         *reply_len = 1;
         return 0;
     }
 
-    if (build_credential_id(&rng, rpIdHash, credId, sizeof(credId), &credIdLen, user_private) != 0) {
-        wc_FreeRng(&rng);
-        reply[0] = CTAP2_ERR_INVALID_COMMAND;
+    if (cred_pick_free(&slot) != CRED_OK) {
+        reply[0] = CTAP2_ERR_KEY_STORE_FULL;
         *reply_len = 1;
         return 0;
     }
-
-    wc_ecc_init(&user_ecc);
-    wc_ecc_init(&cert_ecc);
-
-    word32 inOutIdx = 0;
-    if (wc_ecc_import_private_key_ex(user_private, ECC_SZ, NULL, 0, &user_ecc, ECC_SECP256R1) != 0) {
-        ret = -1; goto cleanup;
+    /* Opaque credential id: 64 random bytes from the chip's TRNG. */
+    if (se_random32(credId) != 0 || se_random32(credId + 32) != 0) {
+        reply[0] = CTAP2_ERR_OTHER;
+        *reply_len = 1;
+        return 0;
     }
-    if (wc_ecc_make_pub_ex(&user_ecc, NULL, NULL) != 0) {
-        ret = -1; goto cleanup;
+    credIdLen = CRED_ID_LEN;
+    /* The credential private key is created INSIDE the chip; only the public key comes out. */
+    if (se_genkey(slot, pub, pub + 32) != 0) {
+        reply[0] = CTAP2_ERR_OTHER;
+        *reply_len = 1;
+        return 0;
     }
-
-    word32 qxlen = ECC_SZ, qylen = ECC_SZ;
-    if (wc_ecc_export_public_raw(&user_ecc, qx, &qxlen, qy, &qylen) != 0) {
-        ret = -1; goto cleanup;
-    }
-
-    rk_load();
-    if (params.rk) {
-        int slot = rk_find_free();
-        if (slot >= 0) {
-            memcpy(rk_slots[slot].magic, "RK!!", 4);
-            memcpy(rk_slots[slot].rpIdHash, rpIdHash, HASH_SZ);
-            rk_slots[slot].cred_id_len = credIdLen;
-            memcpy(rk_slots[slot].cred_id, credId, credIdLen);
-            rk_slots[slot].counter = device_get_counter();
-            if (params.user_handle && params.user_handle_len <= sizeof(rk_slots[slot].user_handle))
-                memcpy(rk_slots[slot].user_handle, params.user_handle, params.user_handle_len);
-            memcpy(rk_slots[slot].pub_qx, qx, ECC_SZ);
-            memcpy(rk_slots[slot].pub_qy, qy, ECC_SZ);
-            rk_save();
-        }
-    }
-
-    if (wc_EccPrivateKeyDecode(cert_master_key_der, &inOutIdx, &cert_ecc, cert_master_key_der_len) != 0) {
-        ret = -1; goto cleanup;
-    }
-    if (wc_ecc_check_key(&cert_ecc) != 0) {
-        ret = -1; goto cleanup;
-    }
+    memcpy(qx, pub, 32);
+    memcpy(qy, pub + 32, 32);
 
     uint8_t flags = 0x41;
     if (pin_store.magic == FLASH_PIN_MAGIC && params.pin_auth && params.pin_auth_len == 16)
@@ -1352,12 +1250,16 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     wc_Sha256Update(&sha, authData, authDataLen);
     wc_Sha256Update(&sha, params.clientDataHash, params.cdh_len);
     wc_Sha256Final(&sha, digest);
-
-    siglen = (word32)wc_ecc_sig_size(&cert_ecc);
-    ret = wc_ecc_sign_hash(digest, HASH_SZ, signature, &siglen, &rng, &cert_ecc);
     wc_Sha256Free(&sha);
-    if (ret != 0)
-        goto cleanup;
+
+    /* Batch attestation: signed by the attestation key held in the chip. */
+    if (hw_sign_der(SE_ATT_SLOT, att_cert_pub(), digest, signature, &siglen16) != 0) {
+        ret = -1; goto cleanup;
+    }
+    siglen = siglen16;
+    if (cred_commit(slot, rpIdHash, credId, pub) != CRED_OK) {
+        ret = CTAP2_ERR_KEY_STORE_FULL; goto cleanup;
+    }
 
     device_counter_inc();
 
@@ -1377,18 +1279,16 @@ static int ctap2_make_credential(const uint8_t *payload, uint16_t payload_len,
     if (cbor_put_bytes(&c, signature, (uint16_t)siglen) != 0) { ret = -1; goto cleanup; }
     if (cbor_put_text(&c, "x5c") != 0) { ret = -1; goto cleanup; }
     if (cbor_start_array(&c, 1) != 0) { ret = -1; goto cleanup; }
-    if (cbor_put_bytes(&c, cert_att_der, cert_att_der_len) != 0) { ret = -1; goto cleanup; }
+    cert = att_cert_der(&certlen);
+    if (cbor_put_bytes(&c, cert, certlen) != 0) { ret = -1; goto cleanup; }
 
     *reply_len = c.len;
     ret = 0;
 
 cleanup:
-    wc_FreeRng(&rng);
-    wc_ecc_free(&user_ecc);
-    wc_ecc_free(&cert_ecc);
-    ForceZero(user_private, sizeof(user_private));
     if (ret != 0) {
-        reply[0] = CTAP2_ERR_INVALID_COMMAND;
+        /* keep a specific status (KEY_STORE_FULL), otherwise a generic error */
+        reply[0] = (ret > 0) ? (uint8_t)ret : CTAP2_ERR_INVALID_COMMAND;
         *reply_len = 1;
         return 0;
     }
@@ -1400,16 +1300,14 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
 {
     struct ga_params params;
     uint8_t rpIdHash[HASH_SZ];
-    uint8_t private[ECC_SZ];
-    uint8_t handle_hash[HASH_SZ];
+    uint8_t slot = 0, pub[64];
+    uint16_t siglen16 = 0;
     uint8_t authData[64];
     uint16_t authDataLen = 0;
     uint8_t sigbuf[SIGMAX_SZ];
     uint8_t digest[HASH_SZ];
     word32 siglen = SIGMAX_SZ;
     wc_Sha256 sha;
-    ecc_key user_ecc;
-    WC_RNG rng;
     int ret = 0;
 
     if (parse_getassert(payload + 1, payload_len - 1, &params) != 0) {
@@ -1436,7 +1334,7 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
         return 0;
     }
 
-    if (params.cred_id_len != (NONCE_SZ + HASH_SZ)) {
+    if (params.cred_id_len != CRED_ID_LEN) {
         reply[0] = CTAP2_ERR_NO_CREDENTIALS;
         *reply_len = 1;
         return 0;
@@ -1447,37 +1345,18 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     wc_Sha256Final(&sha, rpIdHash);
     wc_Sha256Free(&sha);
 
-    /* Re-derive key and verify handle hash */
-    if (derive_user_key(rpIdHash, params.cred_id, private, handle_hash) != 0) {
-        reply[0] = CTAP2_ERR_NO_CREDENTIALS;
-        *reply_len = 1;
-        return 0;
-    }
-    if (memcmp(handle_hash, params.cred_id + NONCE_SZ, HASH_SZ) != 0) {
+    /* The id must name a key that exists in THIS chip for THIS relying party. */
+    if (cred_find(rpIdHash, params.cred_id, &slot, pub) != CRED_OK) {
         reply[0] = CTAP2_ERR_NO_CREDENTIALS;
         *reply_len = 1;
         return 0;
     }
 
-    /* Require user presence */
-    gpio_put(U2F_LED, 1);
-    while (gpio_get(PRESENCE_BUTTON) != 0) {
-        sleep_ms(2);
-    }
-    gpio_put(U2F_LED, 0);
-
-    if (wc_InitRng(&rng) != 0) {
-        reply[0] = CTAP2_ERR_INVALID_COMMAND;
+    /* Require user presence (fresh press, bounded wait) */
+    if (!device_user_presence()) {
+        reply[0] = CTAP2_ERR_USER_ACTION_TIMEOUT;
         *reply_len = 1;
         return 0;
-    }
-
-    wc_ecc_init(&user_ecc);
-    if (wc_ecc_import_private_key_ex(private, ECC_SZ, NULL, 0, &user_ecc, ECC_SECP256R1) != 0) {
-        ret = -1; goto ga_cleanup;
-    }
-    if (wc_ecc_make_pub_ex(&user_ecc, NULL, NULL) != 0) {
-        ret = -1; goto ga_cleanup;
     }
 
     uint8_t flags = 0x01;
@@ -1494,10 +1373,11 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     wc_Sha256Final(&sha, digest);
     wc_Sha256Free(&sha);
 
-    siglen = (word32)wc_ecc_sig_size(&user_ecc);
-    ret = wc_ecc_sign_hash(digest, HASH_SZ, sigbuf, &siglen, &rng, &user_ecc);
-    if (ret != 0)
-        goto ga_cleanup;
+    /* The assertion signature is made inside the chip by this credential's key. */
+    if (hw_sign_der(slot, pub, digest, sigbuf, &siglen16) != 0) {
+        ret = -1; goto ga_cleanup;
+    }
+    siglen = siglen16;
 
     device_counter_inc();
 
@@ -1521,9 +1401,6 @@ static int ctap2_get_assertion(const uint8_t *payload, uint16_t payload_len,
     *reply_len = c.len;
 
 ga_cleanup:
-    wc_FreeRng(&rng);
-    wc_ecc_free(&user_ecc);
-    ForceZero(private, sizeof(private));
     if (ret != 0) {
         reply[0] = CTAP2_ERR_NO_CREDENTIALS;
         *reply_len = 1;
@@ -1676,7 +1553,7 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             wc_HmacUpdate(&hmac, newPinEnc, newPinEnc_len);
             wc_HmacFinal(&hmac, tmp);
             wc_HmacFree(&hmac);
-            if (memcmp(tmp, pin_auth, 32) != 0) {
+            if (!ct_memeq(tmp, pin_auth, 32)) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
             uint16_t dec_len = 0;
@@ -1684,11 +1561,19 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
             /* derive hash */
-            uint16_t pin_len = 0;
+            uint16_t pin_len = 64; /* padded block: the PIN ends at the first 0x00 */
             for (int i = 0; i < 64; i++) {
                 if (tmp[i] == 0) { pin_len = (uint16_t)i; break; }
             }
-            if (pin_len == 0) pin_len = 64;
+            if (pin_len < PIN_MIN_LEN) {
+                reply[0] = CTAP2_ERR_PIN_POLICY_VIOLATION; *reply_len = 1; return 0;
+            }
+            /* Choosing the PIN of a fresh key needs the owner physically
+             * present: otherwise any program on the host could claim it. */
+            if (!device_user_presence()) {
+                ForceZero(tmp, sizeof(tmp));
+                reply[0] = CTAP2_ERR_USER_ACTION_TIMEOUT; *reply_len = 1; return 0;
+            }
             if (pin_hash_plain(tmp, pin_len, pin_store.pin_hash) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
@@ -1720,11 +1605,11 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                 return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len);
             }
             uint16_t dec_len = 0;
+            pin_attempt_begin();
             if (pin_decrypt(shared + 32, pinHashEnc, (uint16_t)pinHashEnc_len, tmp, &dec_len) != 0 || dec_len != 16) {
                 return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len);
             }
-            if (memcmp(tmp, pin_store.pin_hash, 16) != 0) {
-                pin_fail_retry();
+            if (!ct_memeq(tmp, pin_store.pin_hash, 16)) {
                 reply[0] = CTAP2_ERR_PIN_INVALID; *reply_len = 1; return 0;
             }
             if (wc_HmacInit(&hmac, NULL, 0) != 0) { return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len); }
@@ -1734,18 +1619,19 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
             wc_HmacUpdate(&hmac, pinHashEnc, pinHashEnc_len);
             wc_HmacFinal(&hmac, tmp);
             wc_HmacFree(&hmac);
-            if (memcmp(tmp, pin_auth, 32) != 0) {
-                pin_fail_retry();
+            if (!ct_memeq(tmp, pin_auth, 32)) {
                 return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len);
             }
             if (pin_decrypt(shared + 32, newPinEnc, (uint16_t)newPinEnc_len, tmp, &dec_len) != 0 || dec_len != 64) {
                 return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len);
             }
-            uint16_t pin_len = 0;
+            uint16_t pin_len = 64; /* padded block: the PIN ends at the first 0x00 */
             for (int i = 0; i < 64; i++) {
                 if (tmp[i] == 0) { pin_len = (uint16_t)i; break; }
             }
-            if (pin_len == 0) pin_len = 64;
+            if (pin_len < PIN_MIN_LEN) {
+                reply[0] = CTAP2_ERR_PIN_POLICY_VIOLATION; *reply_len = 1; return 0;
+            }
             if (pin_hash_plain(tmp, pin_len, pin_store.pin_hash) != 0) {
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
@@ -1777,11 +1663,11 @@ static int ctap2_client_pin(const uint8_t *payload, uint16_t payload_len,
                 reply[0] = CTAP2_ERR_PIN_AUTH_INVALID; *reply_len = 1; return 0;
             }
             uint16_t dec_len = 0;
+            pin_attempt_begin();
             if (pin_decrypt(shared + 32, pinHashEnc, (uint16_t)pinHashEnc_len, tmp, &dec_len) != 0 || dec_len != 16) {
                 return write_error(CTAP2_ERR_PIN_AUTH_INVALID, reply, reply_len);
             }
-            if (memcmp(tmp, pin_store.pin_hash, 16) != 0) {
-                pin_fail_retry();
+            if (!ct_memeq(tmp, pin_store.pin_hash, 16)) {
                 reply[0] = CTAP2_ERR_PIN_INVALID; *reply_len = 1; return 0;
             }
             wc_InitRng(&rng);
@@ -1827,9 +1713,29 @@ int ctap2_handle_cbor(const uint8_t *payload, uint16_t payload_len,
         case CTAP2_CMD_CLIENT_PIN:
             return ctap2_client_pin(payload, payload_len, reply, reply_max, reply_len);
         case CTAP2_CMD_RESET:
+            /* Reset wipes the PIN and the discoverable credentials. It used to
+             * run for any host process, silently: require a recent power-up
+             * AND a physical button press. */
+            if (RESET_WINDOW_MS != 0 && device_uptime_ms() > RESET_WINDOW_MS) {
+                reply[0] = CTAP2_ERR_NOT_ALLOWED;
+                *reply_len = 1;
+                return 0;
+            }
+            if (!device_user_presence()) {
+                reply[0] = CTAP2_ERR_USER_ACTION_TIMEOUT;
+                *reply_len = 1;
+                return 0;
+            }
+            /* Reset must invalidate every credential: forget them and destroy
+             * their private keys in the chip, otherwise a thief who resets the
+             * key (clearing the PIN and its retry lock) could keep using all
+             * existing registrations without knowing the PIN. */
+            if (device_reset_credentials() != 0) {
+                reply[0] = CTAP2_ERR_OTHER;
+                *reply_len = 1;
+                return 0;
+            }
             pin_state_reset();
-            rk_reset();
-            fdo_init();
             reply[0] = CTAP2_ERR_SUCCESS;
             *reply_len = 1;
             return 0;

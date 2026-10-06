@@ -26,20 +26,37 @@
 #include "hardware/adc.h"
 #include "bsp/board.h"
 #include "pins.h"
+#include "se.h"
+#include "device_state.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
 #include "user_settings.h"
 #include "wolfssl/wolfcrypt/settings.h"
 #include "hardware/clocks.h"
-#include "fdo.h"
     
-extern void u2f_init(void);
+extern int u2f_init(void);
+
+/* The secure element is missing / unusable / not provisioned: blink the reason
+ * (1..7 flashes) forever.  There is no software fallback, and the device never
+ * enumerates on USB. */
+static void se_fail(int code)
+{
+    for (;;) {
+        for (int i = 0; i < code; i++) {
+            gpio_put(U2F_LED, 1); sleep_ms(150);
+            gpio_put(U2F_LED, 0); sleep_ms(250);
+        }
+        sleep_ms(1500);
+    }
+}
 
 void system_boot(void)
 {
+    int e;
+
     /* Setting system clock */
     set_sys_clock_48mhz();
-    
+
     /* Setting GPIOs for Led + Button */
     gpio_init(U2F_LED);
     gpio_set_dir(U2F_LED, GPIO_OUT);
@@ -48,13 +65,16 @@ void system_boot(void)
     gpio_set_dir(PRESENCE_BUTTON, GPIO_IN);
     gpio_pull_up(PRESENCE_BUTTON);
 
-    /* Initializing U2F parser */
-    u2f_init();
-    fdo_init();
+    /* All keys live in the ATECC608: refuse to run without a correctly provisioned chip */
+    if ((e = se_init()) != SE_OK)
+        se_fail(e);
+
+    /* Counter, credential table, attestation identity */
+    if ((e = u2f_init()) != SE_OK)
+        se_fail(e);
 
     /* Initializing TinyUSB device */
     tusb_init();
-
 }
 
 int main(void) {
